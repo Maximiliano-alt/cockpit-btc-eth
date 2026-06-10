@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import {
-  Lock, AlertTriangle, CheckCircle2, XCircle, TrendingDown, Activity,
-  Calendar, ExternalLink, Skull, ShieldAlert, Target, Radio, RefreshCw,
+  Lock, AlertTriangle, CheckCircle2, XCircle,
+  Calendar, ExternalLink, ShieldAlert, Target, Radio, RefreshCw,
   MessageSquare, Send, Stethoscope, Wifi, WifiOff
 } from "lucide-react";
 
@@ -45,8 +45,6 @@ const SNAPSHOT = [
   { label: "Cycle Top", value: "0/30", tag: "Hold", tone: "good" },
   { label: "RSI 22D", value: "31.9", tag: "Sobreventa", tone: "good" },
   { label: "Altcoin Season", value: "46", tag: "NO altseason", tone: "warn" },
-  { label: "ETF BTC (8 Jun)", value: "−91.4M", tag: "Salida", tone: "danger" },
-  { label: "ETF ETH (8 Jun)", value: "+82.4M", tag: "Entrada tentativa", tone: "good" },
 ];
 
 const SOURCES = [
@@ -59,7 +57,6 @@ const SOURCES = [
   { name: "Exness — Web Trading", url: "https://my.exness.market/webtrading/" },
 ];
 
-const EXNESS_CALENDAR = "https://www.exness.com/embeds/tools/calendar/";
 const INTERVALS = [
   { label: "1S", code: "1w" },
   { label: "1D", code: "1d" },
@@ -85,14 +82,14 @@ async function fetchJSON(url, ms = 8000) {
 }
 
 function useLivePrices() {
-  const [data, setData] = useState({ BTCUSDT: null, ETHUSDT: null });
+  const [data, setData] = useState({ BTCUSDT: null, ETHUSDT: null, SOLUSDT: null });
   const [status, setStatus] = useState("loading"); // loading | live | offline
   const [updated, setUpdated] = useState(null);
 
   const load = useCallback(async () => {
     try {
       const url = "https://api.binance.com/api/v3/ticker/24hr?symbols=" +
-        encodeURIComponent('["BTCUSDT","ETHUSDT"]');
+        encodeURIComponent('["BTCUSDT","ETHUSDT","SOLUSDT"]');
       const arr = await fetchJSON(url);
       const next = {};
       arr.forEach((t) => {
@@ -104,11 +101,12 @@ function useLivePrices() {
     } catch {
       try {
         const cg = await fetchJSON(
-          "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd&include_24hr_change=true"
+          "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana&vs_currencies=usd&include_24hr_change=true"
         );
         setData({
           BTCUSDT: { price: cg.bitcoin.usd, change: cg.bitcoin.usd_24h_change },
           ETHUSDT: { price: cg.ethereum.usd, change: cg.ethereum.usd_24h_change },
+          SOLUSDT: { price: cg.solana.usd, change: cg.solana.usd_24h_change },
         });
         setStatus("live");
         setUpdated(new Date());
@@ -127,39 +125,87 @@ function useLivePrices() {
   return { data, status, updated, reload: load };
 }
 
-function useFearGreed() {
+// Fear&Greed + dominancia desde CoinMarketCap (vía function con cache).
+// Fallback: alternative.me y CoinGecko si la function falla o no hay key.
+function useMarketMeta() {
   const [fg, setFg] = useState(null);
-  useEffect(() => {
-    let live = true;
-    const load = async () => {
-      try {
-        const j = await fetchJSON("https://api.alternative.me/fng/?limit=1");
-        if (live && j?.data?.[0]) setFg({ value: +j.data[0].value, label: j.data[0].value_classification });
-      } catch { /* mantiene snapshot */ }
-    };
-    load();
-    const t = setInterval(load, 300000);
-    return () => { live = false; clearInterval(t); };
-  }, []);
-  return fg;
-}
-
-function useDominance() {
   const [dom, setDom] = useState(null);
   useEffect(() => {
     let live = true;
     const load = async () => {
+      let gotFg = false, gotDom = false;
       try {
-        const j = await fetchJSON("https://api.coingecko.com/api/v3/global");
-        const p = j?.data?.market_cap_percentage;
-        if (live && p) setDom({ btc: p.btc, eth: p.eth });
-      } catch { /* snapshot */ }
+        const j = await fetchJSON("/.netlify/functions/market", 12000);
+        if (live && j?.fearGreed) { setFg(j.fearGreed); gotFg = true; }
+        if (live && j?.dominance) { setDom(j.dominance); gotDom = true; }
+      } catch { /* cae al fallback */ }
+      if (!gotFg) {
+        try {
+          const j = await fetchJSON("https://api.alternative.me/fng/?limit=1");
+          if (live && j?.data?.[0]) setFg({ value: +j.data[0].value, label: j.data[0].value_classification });
+        } catch { /* mantiene snapshot */ }
+      }
+      if (!gotDom) {
+        try {
+          const j = await fetchJSON("https://api.coingecko.com/api/v3/global");
+          const p = j?.data?.market_cap_percentage;
+          if (live && p) setDom({ btc: p.btc, eth: p.eth });
+        } catch { /* snapshot */ }
+      }
     };
     load();
     const t = setInterval(load, 300000);
     return () => { live = false; clearInterval(t); };
   }, []);
-  return dom;
+  return { fg, dom };
+}
+
+// Flujos diarios de ETF (Farside, scrapeado server-side). Refresco cada 30 min.
+function useEtfFlows() {
+  const [etf, setEtf] = useState(null);
+  useEffect(() => {
+    let live = true;
+    const load = async () => {
+      try {
+        const j = await fetchJSON("/.netlify/functions/etf", 20000);
+        if (live && (j?.btc || j?.eth)) setEtf(j);
+      } catch { /* mantiene snapshot */ }
+    };
+    load();
+    const t = setInterval(load, 1800000);
+    return () => { live = false; clearInterval(t); };
+  }, []);
+  return etf;
+}
+
+// Funding rate + open interest de Binance Futures (gratis, CORS abierto).
+// Proxy de presión de liquidaciones ahora que Coinglass es de pago.
+function useDerivs() {
+  const [d, setD] = useState(null);
+  useEffect(() => {
+    let live = true;
+    const load = async () => {
+      try {
+        const syms = ["BTCUSDT", "ETHUSDT"];
+        const next = {};
+        await Promise.all(syms.map(async (s) => {
+          const [pi, oi] = await Promise.all([
+            fetchJSON("https://fapi.binance.com/fapi/v1/premiumIndex?symbol=" + s),
+            fetchJSON("https://fapi.binance.com/fapi/v1/openInterest?symbol=" + s),
+          ]);
+          next[s] = {
+            funding: parseFloat(pi.lastFundingRate) * 100,
+            oiUsd: parseFloat(oi.openInterest) * parseFloat(pi.markPrice),
+          };
+        }));
+        if (live) setD(next);
+      } catch { /* sin datos */ }
+    };
+    load();
+    const t = setInterval(load, 120000);
+    return () => { live = false; clearInterval(t); };
+  }, []);
+  return d;
 }
 
 function useKlines(symbol, interval) {
@@ -329,8 +375,38 @@ function ChartCard({ symbol, cfg, live }) {
   );
 }
 
+// ───────────────────────── calendario económico ────────────────────────────
+// Exness bloquea el iframe (x-frame-options: SAMEORIGIN). TradingView ofrece
+// el mismo calendario como widget embebible gratuito.
+function EconomicCalendar() {
+  const src =
+    "https://s.tradingview.com/embed-widget/events/?locale=es#" +
+    encodeURIComponent(JSON.stringify({
+      colorTheme: "dark",
+      isTransparent: true,
+      width: "100%",
+      height: 450,
+      importanceFilter: "0,1",
+    }));
+  return (
+    <section className="rounded-xl border border-slate-700/60 bg-slate-900/60 p-4">
+      <div className="flex items-center gap-2 mb-3">
+        <Calendar size={16} className="text-slate-300" />
+        <h2 className="text-sm font-mono tracking-wide text-slate-300">Calendario económico (TradingView)</h2>
+      </div>
+      <iframe
+        src={src}
+        title="Calendario económico"
+        className="w-full rounded-md border border-slate-700"
+        style={{ height: 450, border: 0 }}
+      />
+      <p className="mt-2 text-[11px] text-slate-500">Eventos de impacto medio y alto. Antes de CPI/FOMC: manos quietas.</p>
+    </section>
+  );
+}
+
 // ───────────────────────── diagnóstico dinámico ────────────────────────────
-function Diagnosis({ btc, fg }) {
+function Diagnosis({ btc, fg, etf }) {
   const cfg = ASSETS.BTCUSDT;
   const bullets = [];
   let verdict, vtone;
@@ -363,7 +439,13 @@ function Diagnosis({ btc, fg }) {
       : `Fear&Greed ${fgv} (${fg.label}): contexto de sentimiento, sin señal de extremo.`);
   }
   bullets.push("Cycle Top 0/30: riesgo de comprar un techo = bajo. El riesgo real es timing/estructura.");
-  bullets.push("Flujos ETF aún en salida (BTC −91M el 8 Jun): sin reversión confirmada, no anticipar.");
+  if (etf?.btc) {
+    const f = etf.btc;
+    bullets.push(`Flujos ETF BTC ${f.total >= 0 ? "+" : "−"}${Math.abs(f.total).toFixed(1)}M (${f.date}): ${
+      f.total >= 0 ? "entrada — un día no confirma reversión." : "salida — sin reversión confirmada, no anticipar."}`);
+  } else {
+    bullets.push("Flujos ETF aún en salida (BTC −91M el 8 Jun): sin reversión confirmada, no anticipar.");
+  }
   bullets.push("Altseason 46 = NO altseason. Alts fuera (y bloqueadas por mandato).");
 
   return (
@@ -571,10 +653,12 @@ function CoachChat({ btc, eth, fg }) {
 // ───────────────────────── app ─────────────────────────────────────────────
 export default function Cockpit() {
   const { data: prices, status, updated, reload } = useLivePrices();
-  const fg = useFearGreed();
-  const dom = useDominance();
+  const { fg, dom } = useMarketMeta();
+  const etf = useEtfFlows();
+  const derivs = useDerivs();
   const btc = prices.BTCUSDT?.price ?? null;
   const eth = prices.ETHUSDT?.price ?? null;
+  const sol = prices.SOLUSDT?.price ?? null;
 
   const Live = ({ label, value, sub, tone }) => (
     <div className={`rounded-md border px-2.5 py-2 ${tone || "border-slate-700 bg-slate-800/40 text-slate-200"}`}>
@@ -610,26 +694,20 @@ export default function Cockpit() {
             </div>
           </div>
 
-          {/* live ticker + audit */}
-          <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          {/* live ticker */}
+          <div className="mt-4 grid gap-3 sm:grid-cols-3">
             <Live label="BTC/USDT" value={btc ? "$" + Math.round(btc).toLocaleString() : "—"} sub={chg("BTCUSDT")}
               tone={prices.BTCUSDT && prices.BTCUSDT.change < 0 ? toneClasses.danger : "border-emerald-500/30 bg-emerald-500/5 text-emerald-300"} />
             <Live label="ETH/USDT" value={eth ? "$" + Math.round(eth).toLocaleString() : "—"} sub={chg("ETHUSDT")}
               tone={prices.ETHUSDT && prices.ETHUSDT.change < 0 ? toneClasses.danger : "border-emerald-500/30 bg-emerald-500/5 text-emerald-300"} />
-            <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-2.5 py-2">
-              <div className="text-[10px] uppercase tracking-wider text-rose-300 flex items-center gap-1"><Skull size={11} /> Real</div>
-              <div className="font-mono text-base font-bold text-rose-200">0.23 USD</div>
-              <div className="text-[10px] text-rose-300/80">Win 62% · Payoff 0.41</div>
-            </div>
-            <div className="rounded-md border border-slate-700 bg-slate-800/50 px-2.5 py-2">
-              <div className="text-[10px] uppercase tracking-wider text-slate-400 flex items-center gap-1"><Activity size={11} /> Demo</div>
-              <div className="font-mono text-base font-bold text-slate-100">9,932.90</div>
-              <div className="text-[10px] text-amber-300/90">Reseteada — track record 0</div>
-            </div>
+            <Live label="SOL/USDT (solo monitoreo)" value={sol ? "$" + sol.toLocaleString(undefined, { maximumFractionDigits: 2 }) : "—"} sub={chg("SOLUSDT")}
+              tone={prices.SOLUSDT && prices.SOLUSDT.change < 0 ? toneClasses.danger : "border-emerald-500/30 bg-emerald-500/5 text-emerald-300"} />
           </div>
         </header>
 
-        <Diagnosis btc={btc} fg={fg} />
+        <EconomicCalendar />
+
+        <Diagnosis btc={btc} fg={fg} etf={etf} />
 
         {/* charts con zonas */}
         <section className="grid gap-4 lg:grid-cols-3">
@@ -645,10 +723,29 @@ export default function Cockpit() {
         {/* indicadores: live vs snapshot, separados y honestos */}
         <section className="rounded-xl border border-slate-700/60 bg-slate-900/60 p-4">
           <div className="flex items-center gap-2 mb-2"><Radio size={15} className="text-emerald-400" /><h2 className="text-sm font-mono tracking-wide text-slate-300">En vivo</h2></div>
-          <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 mb-4">
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-2 mb-4">
             <Live label="Fear & Greed" value={fg ? String(fg.value) : "16"} sub={fg ? fg.label : "snapshot"} tone={(fg?.value ?? 16) <= 25 ? toneClasses.danger : toneClasses.warn} />
             <Live label="BTC Dominance" value={dom ? dom.btc.toFixed(1) + "%" : "58.2%"} sub={dom ? "live" : "snapshot"} tone={toneClasses.warn} />
             <Live label="ETH Dominance" value={dom ? dom.eth.toFixed(1) + "%" : "9.3%"} sub={dom ? "live" : "snapshot"} tone={toneClasses.warn} />
+            <Live label={`ETF BTC${etf?.btc ? " (" + etf.btc.date.slice(0, 6) + ")" : ""}`}
+              value={etf?.btc ? `${etf.btc.total >= 0 ? "+" : "−"}${Math.abs(etf.btc.total).toFixed(1)}M` : "−91.4M"}
+              sub={etf?.btc ? (etf.btc.total >= 0 ? "Entrada" : "Salida") : "snapshot"}
+              tone={(etf?.btc ? etf.btc.total : -91.4) >= 0 ? toneClasses.good : toneClasses.danger} />
+            <Live label={`ETF ETH${etf?.eth ? " (" + etf.eth.date.slice(0, 6) + ")" : ""}`}
+              value={etf?.eth ? `${etf.eth.total >= 0 ? "+" : "−"}${Math.abs(etf.eth.total).toFixed(1)}M` : "+82.4M"}
+              sub={etf?.eth ? (etf.eth.total >= 0 ? "Entrada" : "Salida") : "snapshot"}
+              tone={(etf?.eth ? etf.eth.total : 82.4) >= 0 ? toneClasses.good : toneClasses.danger} />
+            <Live label="Funding BTC" value={derivs?.BTCUSDT ? derivs.BTCUSDT.funding.toFixed(4) + "%" : "—"}
+              sub={derivs?.BTCUSDT ? (derivs.BTCUSDT.funding < 0 ? "Shorts pagan" : "Longs pagan") : "Binance Futures"}
+              tone={derivs?.BTCUSDT && derivs.BTCUSDT.funding < 0 ? toneClasses.good : toneClasses.warn} />
+            <Live label="Funding ETH" value={derivs?.ETHUSDT ? derivs.ETHUSDT.funding.toFixed(4) + "%" : "—"}
+              sub={derivs?.ETHUSDT ? (derivs.ETHUSDT.funding < 0 ? "Shorts pagan" : "Longs pagan") : "Binance Futures"}
+              tone={derivs?.ETHUSDT && derivs.ETHUSDT.funding < 0 ? toneClasses.good : toneClasses.warn} />
+            <Live label="Open Interest BTC+ETH"
+              value={derivs ? "$" + ((derivs.BTCUSDT?.oiUsd ?? 0) + (derivs.ETHUSDT?.oiUsd ?? 0) > 1e9
+                ? (((derivs.BTCUSDT?.oiUsd ?? 0) + (derivs.ETHUSDT?.oiUsd ?? 0)) / 1e9).toFixed(1) + "B"
+                : (((derivs.BTCUSDT?.oiUsd ?? 0) + (derivs.ETHUSDT?.oiUsd ?? 0)) / 1e6).toFixed(0) + "M") : "—"}
+              sub="Proxy de presión de liquidación" tone={toneClasses.warn} />
           </div>
           <div className="flex items-center gap-2 mb-2"><AlertTriangle size={15} className="text-amber-400" /><h2 className="text-sm font-mono tracking-wide text-slate-300">Snapshot 9 Jun — refrescar manual (no hay API gratis)</h2></div>
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
@@ -668,13 +765,6 @@ export default function Cockpit() {
           <CoachChat btc={btc} eth={eth} fg={fg} />
         </section>
 
-        {/* calendario */}
-        <section className="rounded-xl border border-slate-700/60 bg-slate-900/60 p-4">
-          <div className="flex items-center gap-2 mb-3"><Calendar size={16} className="text-slate-300" /><h2 className="text-sm font-mono tracking-wide text-slate-300">Calendario económico (Exness)</h2></div>
-          <iframe src={EXNESS_CALENDAR} title="Exness Economic Calendar" className="w-full rounded-md border border-slate-700 bg-white" style={{ height: 420, border: 0 }} />
-          <p className="mt-2 text-[11px] text-slate-500">Si no carga, Exness bloquea el embebido — ábrelo directo en la plataforma.</p>
-        </section>
-
         {/* fuentes */}
         <section className="rounded-xl border border-slate-700/60 bg-slate-900/60 p-4">
           <h2 className="text-sm font-mono tracking-wide text-slate-300 mb-1">Fuentes externas</h2>
@@ -690,7 +780,7 @@ export default function Cockpit() {
         </section>
 
         <footer className="text-center text-[11px] text-slate-600 pb-2">
-          Live: precio (Binance), Fear&Greed (alternative.me), dominancia (CoinGecko). Lo demás es snapshot etiquetado. No ejecuta trades.
+          Live: precios (Binance), Fear&Greed y dominancia (CoinMarketCap), flujos ETF (Farside), funding/OI (Binance Futures), calendario (TradingView). Lo demás es snapshot etiquetado. No ejecuta trades.
         </footer>
       </div>
     </div>
