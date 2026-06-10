@@ -1,8 +1,8 @@
-import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
+import React, { useState, useEffect, useMemo, useCallback } from "react";
 import {
   Lock, AlertTriangle, CheckCircle2, XCircle,
   Calendar, ExternalLink, ShieldAlert, Target, Radio, RefreshCw,
-  MessageSquare, Send, Stethoscope, Wifi, WifiOff
+  Stethoscope, Wifi, WifiOff
 } from "lucide-react";
 
 // ───────────────────────── CONFIG: zonas e indicadores ─────────────────────
@@ -58,9 +58,10 @@ const SOURCES = [
 ];
 
 const INTERVALS = [
-  { label: "1S", code: "1w" },
-  { label: "1D", code: "1d" },
   { label: "4H", code: "4h" },
+  { label: "1D", code: "1d" },
+  { label: "1W", code: "1w" },
+  { label: "1M", code: "1M" },
 ];
 const toneClasses = {
   good: "text-emerald-400 border-emerald-500/30 bg-emerald-500/5",
@@ -235,6 +236,7 @@ function useKlines(symbol, interval) {
 // ───────────────────────── gráfico con zonas (SVG) ─────────────────────────
 function ZoneChart({ cfg, candles, err, live }) {
   const W = 720, H = 360, padTop = 10, padBot = 16, padRight = 64;
+  const [hover, setHover] = useState(null); // índice de zona bajo el mouse
   const view = useMemo(() => {
     if (!candles || !candles.length) return null;
     const cs = candles.slice(-150);
@@ -264,9 +266,13 @@ function ZoneChart({ cfg, candles, err, live }) {
 
   const { cs, lo, hi, y, step, bw, plotW } = view;
   const ticks = 5;
-  const zoneColor = (k) =>
-    k === "target" ? "rgba(52,211,153,0.13)" : k === "poi" ? "rgba(56,189,248,0.13)" : "rgba(251,113,133,0.13)";
+  const zoneColor = (k, hovered) =>
+    k === "target" ? `rgba(52,211,153,${hovered ? 0.32 : 0.13})`
+    : k === "poi" ? `rgba(56,189,248,${hovered ? 0.32 : 0.13})`
+    : `rgba(251,113,133,${hovered ? 0.32 : 0.13})`;
+  const zoneStroke = (k) => (k === "target" ? "#34d399" : k === "poi" ? "#38bdf8" : "#fb7185");
   const lineColor = (k) => (k === "stop" ? "#fb7185" : k === "error" ? "#f43f5e" : "#94a3b8");
+  const fmtP = (p) => (p >= 1000 ? Math.round(p).toLocaleString() : p.toFixed(0));
 
   return (
     <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ display: "block" }}>
@@ -283,14 +289,22 @@ function ZoneChart({ cfg, candles, err, live }) {
           </g>
         );
       })}
-      {/* zones */}
+      {/* zones (con precios y hover) */}
       {cfg.zones.map((z, i) => {
         const yt = y(z.to), yb = y(z.from);
+        const hovered = hover === i;
         return (
           <g key={"z" + i}>
-            <rect x={0} y={yt} width={plotW} height={Math.max(2, yb - yt)} fill={zoneColor(z.kind)} />
-            <text x={6} y={yt + 12} fill={z.kind === "target" ? "#6ee7b7" : "#7dd3fc"} fontSize="10" fontFamily="monospace">
-              {z.label}
+            <rect
+              x={0} y={yt} width={plotW} height={Math.max(2, yb - yt)}
+              fill={zoneColor(z.kind, hovered)}
+              stroke={hovered ? zoneStroke(z.kind) : "none"} strokeWidth="1"
+              style={{ cursor: "pointer" }}
+              onMouseEnter={() => setHover(i)}
+              onMouseLeave={() => setHover(null)}
+            />
+            <text x={6} y={yt + 12} fill={z.kind === "target" ? "#6ee7b7" : "#7dd3fc"} fontSize="10" fontFamily="monospace" pointerEvents="none">
+              {z.label} · {fmtP(z.from)}–{fmtP(z.to)}
             </text>
           </g>
         );
@@ -327,6 +341,21 @@ function ZoneChart({ cfg, candles, err, live }) {
           </text>
         </g>
       )}
+      {/* tooltip de zona en hover */}
+      {hover != null && cfg.zones[hover] && (() => {
+        const z = cfg.zones[hover];
+        const txt = `${z.label}: ${fmtP(z.from)} – ${fmtP(z.to)}`;
+        const dist = live ? ` · dist ${(((z.from + z.to) / 2 - live) / live * 100).toFixed(1)}%` : "";
+        const full = txt + dist;
+        const tw = full.length * 6.3 + 18;
+        const ty = Math.max(padTop + 2, Math.min(y(z.to) + 8, H - padBot - 26));
+        return (
+          <g pointerEvents="none">
+            <rect x={8} y={ty} width={tw} height={20} rx={4} fill="#0f172a" stroke={zoneStroke(z.kind)} strokeWidth="1" opacity="0.95" />
+            <text x={17} y={ty + 13.5} fill="#e2e8f0" fontSize="10" fontFamily="monospace">{full}</text>
+          </g>
+        );
+      })()}
     </svg>
   );
 }
@@ -372,6 +401,21 @@ function ChartCard({ symbol, cfg, live }) {
       </div>
       <ZoneChart cfg={cfg} candles={candles} err={err} live={live} />
     </div>
+  );
+}
+
+// ───────────────────────── reloj local en vivo ─────────────────────────────
+function LocalClock() {
+  const [now, setNow] = useState(() => new Date());
+  useEffect(() => {
+    const t = setInterval(() => setNow(new Date()), 1000);
+    return () => clearInterval(t);
+  }, []);
+  const tz = useMemo(() => Intl.DateTimeFormat().resolvedOptions().timeZone, []);
+  return (
+    <span className="inline-flex items-center gap-1.5 rounded-full border border-slate-600 bg-slate-800/60 px-2.5 py-1 text-xs font-mono text-slate-300">
+      {now.toLocaleTimeString()} · {tz.split("/").pop().replace(/_/g, " ")}
+    </span>
   );
 }
 
@@ -474,6 +518,69 @@ function Diagnosis({ btc, fg, etf }) {
   );
 }
 
+// ───────────────────────── playbook de posiciones ──────────────────────────
+// Escenarios condicionados a estructura — NO son señales. Derivados de las
+// zonas de ASSETS (POI, invalidación, imanes). Todo pasa por el filtro R:R.
+const PLAYBOOK = [
+  {
+    horizon: "Semanal",
+    ideas: [
+      { asset: "BTC", side: "Long swing", entry: "POI 58,000–60,000", stop: "54,500", target: "65,000–68,000", rr: "≈1.6–2.0", cond: "Solo con CHoCH confirmado en 4H dentro del POI. Sin confirmación, no hay trade." },
+      { asset: "ETH", side: "Long swing", entry: "POI 1,500–1,550", stop: "1,400", target: "1,750–1,850", rr: "≈1.8–2.4", cond: "Reacción visible en el POI y BTC sosteniendo el suyo." },
+    ],
+  },
+  {
+    horizon: "Mensual",
+    ideas: [
+      { asset: "BTC", side: "Long posición", entry: "Limits escalonados 58,000–60,000", stop: "54,500", target: "Imán 80,000–85,000", rr: "≈4.5–5.5", cond: "La semanal debe dejar de hacer mínimos decrecientes; flujos ETF en reversión." },
+      { asset: "ETH", side: "Long posición", entry: "POI 1,500–1,550", stop: "1,400", target: "Imán 2,400–2,500", rr: "≈7–8", cond: "ETH sigue a BTC: sin BTC constructivo no se abre." },
+    ],
+  },
+  {
+    horizon: "Anual",
+    ideas: [
+      { asset: "BTC", side: "Acumulación", entry: "Escalonada 54,500–60,000", stop: "Cierre semanal bajo 54,500", target: "85,000+ (reevaluar en el imán)", rr: "—", cond: "Tesis on-chain: MVRV-Z < 1, Puell < 1, Cycle Top 0/30. Si cambia, se reevalúa." },
+      { asset: "ETH", side: "Acumulación", entry: "Escalonada 1,400–1,550", stop: "Cierre semanal bajo 1,400", target: "2,500+ (vigilar dominancia)", rr: "—", cond: "Mientras NO haya altseason y ETH/BTC no rompa a la baja." },
+    ],
+  },
+];
+
+function Playbook() {
+  return (
+    <section className="rounded-xl border border-slate-700/60 bg-slate-900/60 p-4">
+      <div className="flex items-center gap-2 mb-1">
+        <Target size={16} className="text-slate-300" />
+        <h2 className="text-sm font-mono tracking-wide text-slate-300">Posibles posiciones — semanal · mensual · anual</h2>
+      </div>
+      <p className="text-[11px] text-slate-500 mb-3">Escenarios, no señales. Antes de ejecutar: filtro R:R + Bitácora.</p>
+      <div className="grid gap-3 lg:grid-cols-3">
+        {PLAYBOOK.map((h) => (
+          <div key={h.horizon} className="rounded-lg border border-slate-700/60 bg-slate-950/40 p-3">
+            <div className="font-mono text-xs uppercase tracking-wider text-slate-400 mb-2">{h.horizon}</div>
+            <div className="space-y-3">
+              {h.ideas.map((p, i) => (
+                <div key={i} className="rounded-md border border-slate-700 bg-slate-900/60 p-2.5">
+                  <div className="flex items-center justify-between">
+                    <span className="font-mono text-sm font-bold text-slate-100">{p.asset}</span>
+                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-sky-500/10 border border-sky-500/30 text-sky-300">{p.side}</span>
+                  </div>
+                  <dl className="mt-2 space-y-1 text-[11px] font-mono">
+                    <div className="flex justify-between gap-2"><dt className="text-slate-500">Entrada</dt><dd className="text-slate-200 text-right">{p.entry}</dd></div>
+                    <div className="flex justify-between gap-2"><dt className="text-slate-500">Stop</dt><dd className="text-rose-300 text-right">{p.stop}</dd></div>
+                    <div className="flex justify-between gap-2"><dt className="text-slate-500">Target</dt><dd className="text-emerald-300 text-right">{p.target}</dd></div>
+                    <div className="flex justify-between gap-2"><dt className="text-slate-500">R:R</dt><dd className="text-slate-200 text-right">{p.rr}</dd></div>
+                  </dl>
+                  <p className="mt-1.5 text-[11px] text-slate-400">{p.cond}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 // ───────────────────────── filtro R:R + checklist (igual) ──────────────────
 function RiskGate() {
   const [entry, setEntry] = useState(""), [stop, setStop] = useState(""), [target, setTarget] = useState("");
@@ -540,112 +647,20 @@ const CHECKS = [
   "Stop por DEBAJO del cluster retail obvio",
   "Sin evento macro de alto impacto pendiente (CPI/FOMC)",
 ];
+// Lista de referencia, sin interacción — el control real es la Bitácora pre-log.
 function Checklist() {
-  const [s, setS] = useState(CHECKS.map(() => false));
-  const all = s.every(Boolean);
   return (
     <div className="rounded-lg border border-slate-700/60 bg-slate-900/50 p-4">
-      <div className="flex items-center gap-2 mb-3"><ShieldAlert size={16} className="text-slate-300" /><h3 className="font-mono text-sm tracking-wide text-slate-200">Compuerta pre-trade</h3></div>
+      <div className="flex items-center gap-2 mb-3"><ShieldAlert size={16} className="text-slate-300" /><h3 className="font-mono text-sm tracking-wide text-slate-200">Compuerta pre-trade (referencia)</h3></div>
       <ul className="space-y-1.5">
         {CHECKS.map((c, i) => (
-          <li key={i}>
-            <button onClick={() => setS((x) => x.map((v, j) => (j === i ? !v : v)))} className="flex w-full items-center gap-2.5 text-left group">
-              <span className={`grid place-items-center h-4 w-4 rounded border shrink-0 ${s[i] ? "bg-emerald-500 border-emerald-500" : "border-slate-600 group-hover:border-slate-400"}`}>
-                {s[i] && <CheckCircle2 size={12} className="text-slate-950" />}
-              </span>
-              <span className={`text-xs ${s[i] ? "text-slate-300" : "text-slate-400"}`}>{c}</span>
-            </button>
+          <li key={i} className="flex items-start gap-2.5">
+            <CheckCircle2 size={14} className="text-slate-500 mt-0.5 shrink-0" />
+            <span className="text-xs text-slate-400">{c}</span>
           </li>
         ))}
       </ul>
-      <div className={`mt-3 rounded-md px-3 py-2 text-xs font-semibold ${all ? "bg-emerald-500/10 border border-emerald-500/40 text-emerald-300" : "bg-slate-800/60 border border-slate-700 text-slate-400"}`}>
-        {all ? "Compuerta abierta — recién ahora se considera el trade." : "Compuerta cerrada. Faltan condiciones."}
-      </div>
-    </div>
-  );
-}
-
-// ───────────────────────── chat con Claude Sonnet ──────────────────────────
-function CoachChat({ btc, eth, fg }) {
-  const [msgs, setMsgs] = useState([]);
-  const [input, setInput] = useState("");
-  const [loading, setLoading] = useState(false);
-  const endRef = useRef(null);
-  useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth" }); }, [msgs, loading]);
-
-  const system = () =>
-    `Eres el coach institucional de trading de Maximiliano (Max). Estilo: directo, sin azúcar, brutalmente honesto, en español. ` +
-    `REGLAS NO NEGOCIABLES que debes hacer cumplir: (1) Universo SOLO BTC y ETH hasta lograr 3 meses consecutivos rentables en demo. ` +
-    `Rechaza SOL, altcoins, TSLA, NVDA, US500 y cualquier expansión de scope. (2) Nunca animes a resetear la cuenta demo — destruye el track record. ` +
-    `(3) El problema central de Max es el R:R / payoff ratio (real histórico 0.41 vs objetivo 1.5), no la dirección: gana 62% pero pierde plata porque las pérdidas (~$11.59) superan a las ganancias (~$4.79). Esperanza negativa. ` +
-    `(4) Entrar en números redondos (70000, 2000) es un defecto: trampa de liquidez, stops inflados. Entradas en POI cerca de la invalidación. ` +
-    `(5) No ejecutas trades; la Bitácora pre-log es la compuerta. ` +
-    `Contexto actual: BTC ${btc ? "$" + Math.round(btc).toLocaleString() : "?"}, ETH ${eth ? "$" + Math.round(eth).toLocaleString() : "?"}, Fear&Greed ${fg?.value ?? "?"}. ` +
-    `Estructura semanal bajista, on-chain en zona de valor (MVRV-Z 0.32, Puell 0.55, Mayer 0.81, Cycle 0/30), flujos ETF aún en salida. ` +
-    `BTC POI acumulación 58k-60k, invalidación 54.5k, imán 80k-85k. Sé conciso (máx ~150 palabras). Si Max intenta romper una regla, dícelo sin suavizar.`;
-
-  const send = async () => {
-    const text = input.trim();
-    if (!text || loading) return;
-    const history = [...msgs, { role: "user", content: text }];
-    setMsgs(history);
-    setInput("");
-    setLoading(true);
-    try {
-      const res = await fetch("/.netlify/functions/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          system: system(),
-          messages: history.map((m) => ({ role: m.role, content: m.content })),
-        }),
-      });
-      const data = await res.json();
-      const reply = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
-      setMsgs((m) => [...m, { role: "assistant", content: reply || "Sin respuesta. Reintenta." }]);
-    } catch {
-      setMsgs((m) => [...m, { role: "assistant", content: "No se pudo conectar con Claude. Revisa la conexión y reintenta." }]);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  return (
-    <div className="rounded-xl border border-slate-700/60 bg-slate-900/60 flex flex-col" style={{ minHeight: 380 }}>
-      <div className="flex items-center gap-2 px-4 py-3 border-b border-slate-700/60">
-        <MessageSquare size={16} className="text-slate-300" />
-        <h2 className="text-sm font-mono tracking-wide text-slate-300">Pregunta al coach (Claude Sonnet)</h2>
-      </div>
-      <div className="flex-1 overflow-y-auto px-4 py-3 space-y-3" style={{ maxHeight: 360 }}>
-        {msgs.length === 0 && (
-          <p className="text-xs text-slate-500">
-            Conoce tu contexto (BTC/ETH-only, payoff 0.41, zonas de hoy). Pregunta cosas como “¿la posición de 70k la cierro o la mantengo?” o “¿dónde pongo el stop si entro en el POI?”. No espera que le des la razón.
-          </p>
-        )}
-        {msgs.map((m, i) => (
-          <div key={i} className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}>
-            <div className={`max-w-[85%] rounded-lg px-3 py-2 text-sm whitespace-pre-wrap ${
-              m.role === "user" ? "bg-slate-200 text-slate-900" : "bg-slate-800 text-slate-200 border border-slate-700"}`}>
-              {m.content}
-            </div>
-          </div>
-        ))}
-        {loading && <div className="text-xs text-slate-500 font-mono">pensando…</div>}
-        <div ref={endRef} />
-      </div>
-      <div className="flex items-center gap-2 p-3 border-t border-slate-700/60">
-        <input
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter") send(); }}
-          placeholder="Escribe tu pregunta…"
-          className="flex-1 rounded-md bg-slate-950 border border-slate-700 px-3 py-2 text-sm text-slate-100 focus:border-slate-400 focus:outline-none"
-        />
-        <button onClick={send} disabled={loading}
-          className="grid place-items-center h-9 w-9 rounded-md bg-slate-200 text-slate-900 disabled:opacity-40 hover:bg-white transition">
-          <Send size={15} />
-        </button>
-      </div>
+      <p className="mt-3 text-[11px] text-slate-500">Si una sola no se cumple, no hay trade.</p>
     </div>
   );
 }
@@ -676,10 +691,11 @@ export default function Cockpit() {
         <header className="rounded-xl border border-slate-700/60 bg-slate-900/60 p-4 md:p-5">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
-              <h1 className="text-xl md:text-2xl font-bold tracking-tight text-slate-50">Cockpit BTC / ETH</h1>
+              <h1 className="text-xl md:text-2xl font-bold tracking-tight text-slate-50">CRYPTO TRADING</h1>
               <p className="text-xs text-slate-400 font-mono">Monitoreo + disciplina · solo BTC/ETH</p>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
+              <LocalClock />
               <span className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-mono ${
                 status === "live" ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
                 : status === "offline" ? "border-rose-500/40 bg-rose-500/10 text-rose-300"
@@ -707,8 +723,6 @@ export default function Cockpit() {
 
         <EconomicCalendar />
 
-        <Diagnosis btc={btc} fg={fg} etf={etf} />
-
         {/* charts con zonas */}
         <section className="grid gap-4 lg:grid-cols-3">
           <ChartCard symbol="BTCUSDT" cfg={ASSETS.BTCUSDT} live={btc} />
@@ -719,6 +733,10 @@ export default function Cockpit() {
             <p className="mt-1 text-[11px] text-amber-200/70 max-w-[220px]">Se desbloquea tras 3 meses consecutivos rentables en demo.</p>
           </div>
         </section>
+
+        <Diagnosis btc={btc} fg={fg} etf={etf} />
+
+        <Playbook />
 
         {/* indicadores: live vs snapshot, separados y honestos */}
         <section className="rounded-xl border border-slate-700/60 bg-slate-900/60 p-4">
@@ -759,10 +777,10 @@ export default function Cockpit() {
           </div>
         </section>
 
-        {/* disciplina + chat */}
+        {/* disciplina */}
         <section className="grid gap-4 lg:grid-cols-2">
-          <div className="space-y-4"><RiskGate /><Checklist /></div>
-          <CoachChat btc={btc} eth={eth} fg={fg} />
+          <RiskGate />
+          <Checklist />
         </section>
 
         {/* fuentes */}
