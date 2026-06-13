@@ -325,6 +325,43 @@ function useAiDiagnosis(online, ctxRef) {
   return ai;
 }
 
+// Zonas dinámicas por LLM (function zones, cache 4 h). Manda las velas diarias
+// reales de cada activo + contexto; si la respuesta es válida reemplaza las
+// zonas estáticas de ASSETS. Si falla, los gráficos mantienen las de config.
+function useAiZones(online, ctxRef) {
+  const [z, setZ] = useState(null);
+  useEffect(() => {
+    if (!online) return;
+    let live = true;
+    const load = async () => {
+      try {
+        const syms = ["BTCUSDT", "ETHUSDT", "SOLUSDT"];
+        const assets = {};
+        await Promise.all(syms.map(async (s) => {
+          const k = await fetchJSON(`https://api.binance.com/api/v3/klines?symbol=${s}&interval=1d&limit=120`);
+          assets[s] = {
+            price: +k[k.length - 1][4],
+            velasDiarias: k.map((c) => [+(+c[2]).toPrecision(6), +(+c[3]).toPrecision(6), +(+c[4]).toPrecision(6)]),
+          };
+        }));
+        const { zonasIA, ...contexto } = ctxRef.current || {};
+        const res = await fetch("/.netlify/functions/zones", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ assets, contexto }),
+        });
+        if (!res.ok) return;
+        const j = await res.json();
+        if (live && j?.zones) setZ(j);
+      } catch { /* mantiene zonas estáticas */ }
+    };
+    const first = setTimeout(load, 8000);
+    const t = setInterval(load, 4 * 60 * 60 * 1000);
+    return () => { live = false; clearTimeout(first); clearInterval(t); };
+  }, [online, ctxRef]);
+  return z;
+}
+
 function useKlines(symbol, interval) {
   const [candles, setCandles] = useState(null);
   const [err, setErr] = useState(false);
@@ -553,7 +590,7 @@ function ZoneList({ cfg }) {
   );
 }
 
-function ChartCard({ symbol, cfg, live }) {
+function ChartCard({ symbol, cfg, live, aiTag }) {
   const [iv, setIv] = useState("1d");
   const { candles, err } = useKlines(symbol, iv);
   return (
@@ -564,6 +601,11 @@ function ChartCard({ symbol, cfg, live }) {
           {live != null && (
             <span className="font-mono text-xs text-slate-400">
               ${live >= 1000 ? Math.round(live).toLocaleString() : live.toFixed(2)}
+            </span>
+          )}
+          {aiTag && (
+            <span className="text-[9px] font-mono px-1.5 py-0.5 rounded-full border border-violet-500/40 bg-violet-500/10 text-violet-300">
+              zonas IA
             </span>
           )}
         </div>
@@ -580,6 +622,9 @@ function ChartCard({ symbol, cfg, live }) {
           </a>
         </div>
       </div>
+      {cfg.comment && (
+        <p className="px-3 py-1.5 text-[11px] text-slate-400 border-b border-slate-700/60">{cfg.comment}</p>
+      )}
       <ZoneChart cfg={cfg} candles={candles} err={err} live={live} />
     </div>
   );
@@ -631,8 +676,7 @@ function EconomicCalendar() {
 }
 
 // ───────────────────────── diagnóstico dinámico ────────────────────────────
-function Diagnosis({ btc, fg, etf, onchain, ai }) {
-  const cfg = ASSETS.BTCUSDT;
+function Diagnosis({ btc, fg, etf, onchain, ai, cfg = ASSETS.BTCUSDT }) {
   const bullets = [];
   let verdict, vtone;
 
@@ -685,7 +729,7 @@ function Diagnosis({ btc, fg, etf, onchain, ai }) {
         </div>
         {ai && (
           <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border border-violet-500/40 bg-violet-500/10 text-violet-300">
-            claude-sonnet-4-6 · {new Date(ai.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+            {ai.model || "IA"} · {new Date(ai.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
           </span>
         )}
       </div>
@@ -738,16 +782,24 @@ const PLAYBOOK = [
   },
 ];
 
-function Playbook() {
+function Playbook({ data, aiModel }) {
+  const rows = data?.length ? data : PLAYBOOK;
   return (
     <section className="rounded-xl border border-slate-700/60 bg-slate-900/60 p-4">
-      <div className="flex items-center gap-2 mb-1">
-        <Target size={16} className="text-slate-300" />
-        <h2 className="text-sm font-mono tracking-wide text-slate-300">Posibles posiciones — semanal · mensual · anual</h2>
+      <div className="flex items-center justify-between gap-2 mb-1">
+        <div className="flex items-center gap-2">
+          <Target size={16} className="text-slate-300" />
+          <h2 className="text-sm font-mono tracking-wide text-slate-300">Posibles posiciones — semanal · mensual · anual</h2>
+        </div>
+        {data?.length && aiModel ? (
+          <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border border-violet-500/40 bg-violet-500/10 text-violet-300">
+            {aiModel}
+          </span>
+        ) : null}
       </div>
       <p className="text-[11px] text-slate-500 mb-3">Escenarios, no señales. Antes de ejecutar: filtro R:R + Bitácora.</p>
       <div className="grid gap-3 lg:grid-cols-3">
-        {PLAYBOOK.map((h) => (
+        {rows.map((h) => (
           <div key={h.horizon} className="rounded-lg border border-slate-700/60 bg-slate-950/40 p-3">
             <div className="font-mono text-xs uppercase tracking-wider text-slate-400 mb-2">{h.horizon}</div>
             <div className="space-y-3">
@@ -775,6 +827,18 @@ function Playbook() {
 }
 
 // ───────────────────────── filtro R:R + checklist (igual) ──────────────────
+// Fuera de RiskGate a propósito: definirlo adentro hacía que React lo tratara
+// como un componente nuevo en cada render y el input perdía el foco al tipear.
+function RiskField({ label, val, set, hint }) {
+  return (
+    <label className="block">
+      <span className="text-[11px] uppercase tracking-wider text-slate-400">{label}</span>
+      <input value={val} onChange={(e) => set(e.target.value)} inputMode="decimal" placeholder={hint}
+        className="mt-1 w-full rounded-md bg-slate-950 border border-slate-700 px-2.5 py-1.5 font-mono text-sm text-slate-100 focus:border-slate-400 focus:outline-none" />
+    </label>
+  );
+}
+
 function RiskGate() {
   const [entry, setEntry] = useState(""), [stop, setStop] = useState(""), [target, setTarget] = useState("");
   const [risk, setRisk] = useState("100"), [ppl, setPpl] = useState("1");
@@ -788,13 +852,6 @@ function RiskGate() {
     const round = e % 1000 === 0 || e % 500 === 0;
     return { sd, rr, lots, round, pass: rr >= 1.5 && !round };
   }, [entry, stop, target, risk, ppl]);
-  const F = ({ label, val, set, hint }) => (
-    <label className="block">
-      <span className="text-[11px] uppercase tracking-wider text-slate-400">{label}</span>
-      <input value={val} onChange={(e) => set(e.target.value)} inputMode="decimal" placeholder={hint}
-        className="mt-1 w-full rounded-md bg-slate-950 border border-slate-700 px-2.5 py-1.5 font-mono text-sm text-slate-100 focus:border-slate-400 focus:outline-none" />
-    </label>
-  );
   return (
     <div className="rounded-lg border border-slate-700/60 bg-slate-900/50 p-4">
       <div className="flex items-center gap-2 mb-3">
@@ -802,11 +859,11 @@ function RiskGate() {
         <h3 className="font-mono text-sm tracking-wide text-slate-200">Filtro R:R + Lotaje</h3>
       </div>
       <div className="grid grid-cols-2 gap-3">
-        <F label="Entrada" val={entry} set={setEntry} hint="58500" />
-        <F label="Stop" val={stop} set={setStop} hint="54800" />
-        <F label="Target" val={target} set={setTarget} hint="80000" />
-        <F label="Riesgo $" val={risk} set={setRisk} hint="100" />
-        <F label="$/punto/lote" val={ppl} set={setPpl} hint="BTC≈1 · ETH verificar" />
+        <RiskField label="Entrada" val={entry} set={setEntry} hint="58500" />
+        <RiskField label="Stop" val={stop} set={setStop} hint="54800" />
+        <RiskField label="Target" val={target} set={setTarget} hint="80000" />
+        <RiskField label="Riesgo $" val={risk} set={setRisk} hint="100" />
+        <RiskField label="$/punto/lote" val={ppl} set={setPpl} hint="BTC≈1 · ETH verificar" />
       </div>
       {r && (
         <div className="mt-4 space-y-2">
@@ -870,8 +927,11 @@ export default function Cockpit() {
   const eth = prices.ETHUSDT?.price ?? null;
   const sol = prices.SOLUSDT?.price ?? null;
 
-  // Contexto completo para el diagnóstico IA — siempre con el último estado.
+  // Contexto completo para la IA — siempre con el último estado.
   const ctxRef = useRef(null);
+  const ready = status === "live" && btc != null;
+  const ai = useAiDiagnosis(ready, ctxRef);
+  const aiZones = useAiZones(ready, ctxRef);
   ctxRef.current = {
     precios: { btc, eth, sol },
     cambio24h: {
@@ -886,8 +946,31 @@ export default function Cockpit() {
     onchain,
     mayer200d: daily?.mayer ?? null,
     rsi22d: daily?.rsi22 ?? null,
+    zonasIA: aiZones?.zones ?? null,
   };
-  const ai = useAiDiagnosis(status === "live" && btc != null, ctxRef);
+
+  // Config de cada activo: zonas IA si llegaron, estáticas si no.
+  const mergedAssets = useMemo(() => {
+    const out = {};
+    for (const sym of Object.keys(ASSETS)) {
+      const base = ASSETS[sym];
+      const az = aiZones?.zones?.[sym];
+      if (!az) { out[sym] = base; continue; }
+      const poiZone = az.zones.find((z) => z.kind === "poi");
+      const stopLine = az.lines.find((l) => l.kind === "stop");
+      const targetZone = az.zones.find((z) => z.kind === "target");
+      out[sym] = {
+        ...base,
+        zones: az.zones,
+        lines: az.lines,
+        comment: az.comment,
+        poi: poiZone ? { lo: poiZone.from, hi: poiZone.to } : base.poi,
+        invalidation: stopLine ? stopLine.price : base.invalidation,
+        target: targetZone ? targetZone.from : base.target,
+      };
+    }
+    return out;
+  }, [aiZones]);
 
   const Live = ({ label, value, sub, tone }) => (
     <div className={`rounded-md border px-2.5 py-2 ${tone || "border-slate-700 bg-slate-800/40 text-slate-200"}`}>
@@ -935,18 +1018,18 @@ export default function Cockpit() {
           </div>
         </header>
 
-        <EconomicCalendar />
-
         {/* charts con zonas */}
         <section className="grid gap-4 lg:grid-cols-3">
-          <ChartCard symbol="BTCUSDT" cfg={ASSETS.BTCUSDT} live={btc} />
-          <ChartCard symbol="ETHUSDT" cfg={ASSETS.ETHUSDT} live={eth} />
-          <ChartCard symbol="SOLUSDT" cfg={ASSETS.SOLUSDT} live={sol} />
+          <ChartCard symbol="BTCUSDT" cfg={mergedAssets.BTCUSDT} live={btc} aiTag={!!aiZones?.zones?.BTCUSDT} />
+          <ChartCard symbol="ETHUSDT" cfg={mergedAssets.ETHUSDT} live={eth} aiTag={!!aiZones?.zones?.ETHUSDT} />
+          <ChartCard symbol="SOLUSDT" cfg={mergedAssets.SOLUSDT} live={sol} aiTag={!!aiZones?.zones?.SOLUSDT} />
         </section>
 
-        <Diagnosis btc={btc} fg={fg} etf={etf} onchain={onchain} ai={ai} />
+        <EconomicCalendar />
 
-        <Playbook />
+        <Diagnosis btc={btc} fg={fg} etf={etf} onchain={onchain} ai={ai} cfg={mergedAssets.BTCUSDT} />
+
+        <Playbook data={aiZones?.playbook} aiModel={aiZones?.model} />
 
         {/* indicadores: live vs snapshot, separados y honestos */}
         <section className="rounded-xl border border-slate-700/60 bg-slate-900/60 p-4">
