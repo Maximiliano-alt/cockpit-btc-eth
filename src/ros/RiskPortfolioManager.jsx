@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo, useCallback } from "react";
 import {
   Shield, TrendingUp, Activity, Gavel, TrafficCone,
-  Ban, BookOpen, Cpu,
+  Ban, BookOpen, Cpu, Plus, Trash2,
 } from "lucide-react";
 import {
   computeRiskMetrics, computeExposure, classifyMarketPhase,
