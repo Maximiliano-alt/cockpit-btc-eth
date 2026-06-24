@@ -4,41 +4,36 @@ import {
   Calendar, ExternalLink, ShieldAlert, Target, Radio, RefreshCw,
   Stethoscope, Wifi, WifiOff
 } from "lucide-react";
+import RiskPortfolioManager from "./ros/RiskPortfolioManager.jsx";
 
-// ───────────────────────── CONFIG: zonas e indicadores ─────────────────────
-// Zonas derivadas del análisis del 9 Jun 2026. Editables en un solo lugar.
+// ───────────────────────── CONFIG: activos (zonas vienen de IA) ────────────
 const ASSETS = {
   BTCUSDT: {
     name: "BTC / USDT",
     tvSymbol: "BINANCE:BTCUSDT",
-    zones: [
-      { label: "Imán liquidez ↑", from: 80000, to: 85000, kind: "target" },
-      { label: "POI acumulación (sell-side)", from: 58000, to: 60000, kind: "poi" },
-    ],
-    lines: [
-      { label: "Invalidación HTF", price: 54500, kind: "stop" },
-    ],
-    poi: { lo: 58000, hi: 60000 },
-    invalidation: 54500,
-    target: 80000,
+    zones: [],
+    lines: [],
+    poi: null,
+    invalidation: null,
+    target: null,
   },
   ETHUSDT: {
     name: "ETH / USDT",
     tvSymbol: "BINANCE:ETHUSDT",
-    zones: [
-      { label: "Imán liquidez ↑", from: 2400, to: 2500, kind: "target" },
-      { label: "POI acumulación", from: 1500, to: 1550, kind: "poi" },
-    ],
-    lines: [{ label: "Invalidación HTF", price: 1400, kind: "stop" }],
-    poi: { lo: 1500, hi: 1550 },
-    invalidation: 1400,
-    target: 2400,
+    zones: [],
+    lines: [],
+    poi: null,
+    invalidation: null,
+    target: null,
   },
   SOLUSDT: {
     name: "SOL / USDT",
     tvSymbol: "BINANCE:SOLUSDT",
-    zones: [],   // sin análisis de zonas aún — solo monitoreo
+    zones: [],
     lines: [],
+    poi: null,
+    invalidation: null,
+    target: null,
   },
 };
 
@@ -298,13 +293,12 @@ function useBtcDaily() {
   return s;
 }
 
-// Diagnóstico IA (claude-sonnet-4-6 vía function con cache 15 min).
-// Solo dispara cuando el dashboard está online y con precio cargado, para no
-// gastar tokens; el primer request espera 5 s a que llegue el resto del contexto.
-function useAiDiagnosis(online, ctxRef) {
+// Diagnóstico IA — solo cuando las zonas dinámicas ya están listas.
+function useAiDiagnosis(online, ctxRef, aiZones) {
   const [ai, setAi] = useState(null);
+  const zonesReady = !!(aiZones?.zones?.BTCUSDT && aiZones?.zones?.ETHUSDT);
   useEffect(() => {
-    if (!online) return;
+    if (!online || !zonesReady) return;
     let live = true;
     const load = async () => {
       try {
@@ -318,22 +312,22 @@ function useAiDiagnosis(online, ctxRef) {
         if (live && j?.text) setAi(j);
       } catch { /* fallback a reglas */ }
     };
-    const first = setTimeout(load, 5000);
+    load();
     const t = setInterval(load, 15 * 60 * 1000);
-    return () => { live = false; clearTimeout(first); clearInterval(t); };
-  }, [online, ctxRef]);
+    return () => { live = false; clearInterval(t); };
+  }, [online, zonesReady, aiZones?.at, ctxRef]);
   return ai;
 }
 
-// Zonas dinámicas por LLM (function zones, cache 4 h). Manda las velas diarias
-// reales de cada activo + contexto; si la respuesta es válida reemplaza las
-// zonas estáticas de ASSETS. Si falla, los gráficos mantienen las de config.
+// Zonas dinámicas por LLM — reemplazan por completo las zonas estáticas.
 function useAiZones(online, ctxRef) {
   const [z, setZ] = useState(null);
+  const [loading, setLoading] = useState(false);
   useEffect(() => {
     if (!online) return;
     let live = true;
     const load = async () => {
+      setLoading(true);
       try {
         const syms = ["BTCUSDT", "ETHUSDT", "SOLUSDT"];
         const assets = {};
@@ -353,13 +347,14 @@ function useAiZones(online, ctxRef) {
         if (!res.ok) return;
         const j = await res.json();
         if (live && j?.zones) setZ(j);
-      } catch { /* mantiene zonas estáticas */ }
+      } catch { /* sin zonas */ }
+      finally { if (live) setLoading(false); }
     };
-    const first = setTimeout(load, 8000);
+    const first = setTimeout(load, 2000);
     const t = setInterval(load, 4 * 60 * 60 * 1000);
     return () => { live = false; clearTimeout(first); clearInterval(t); };
   }, [online, ctxRef]);
-  return z;
+  return { data: z, loading };
 }
 
 function useKlines(symbol, interval) {
@@ -374,7 +369,7 @@ function useKlines(symbol, interval) {
           `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=400`
         );
         if (!live) return;
-        setCandles(j.map((k) => ({ o: +k[1], h: +k[2], l: +k[3], c: +k[4] })));
+        setCandles(j.map((k) => ({ t: +k[0], o: +k[1], h: +k[2], l: +k[3], c: +k[4] })));
       } catch {
         if (live) setErr(true);
       }
@@ -387,16 +382,54 @@ function useKlines(symbol, interval) {
 }
 
 // ───────────────────────── gráfico con zonas (SVG) ─────────────────────────
-function ZoneChart({ cfg, candles, err, live }) {
-  // Tres paneles: precio (con zonas), RSI 14 + media 14, MACD 12·26·9.
+const CHART_BASE_COUNT = 150;
+const CHART_MIN_COUNT = 12;
+
+function fmtCandleTime(t, interval) {
+  const d = new Date(t);
+  if (interval === "4h") {
+    return d.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  }
+  if (interval === "1w" || interval === "1M") {
+    return d.toLocaleDateString([], { year: "numeric", month: "short", day: "numeric" });
+  }
+  return d.toLocaleDateString([], { month: "short", day: "numeric", year: "2-digit" });
+}
+
+function ZoneChart({ cfg, candles, err, live, interval }) {
   const W = 720, PRICE_H = 360, IND_H = 90, GAP = 14, padTop = 10, padBot = 16, padRight = 64;
   const RSI_TOP = PRICE_H + GAP;
   const MACD_TOP = RSI_TOP + IND_H + GAP;
   const H_TOT = MACD_TOP + IND_H + 4;
-  const [hover, setHover] = useState(null); // índice de zona bajo el mouse
+  const [hover, setHover] = useState(null);
+  const [candleHover, setCandleHover] = useState(null);
+  const [zoom, setZoom] = useState(1);
+  const touchRef = useRef(null);
+  const wrapRef = useRef(null);
+
+  const applyZoomDelta = useCallback((delta) => {
+    setZoom((z) => {
+      const next = z * (delta > 0 ? 1.18 : 1 / 1.18);
+      return Math.max(1, Math.min(8, next));
+    });
+  }, []);
+
+  useEffect(() => {
+    const el = wrapRef.current;
+    if (!el) return;
+    const onWheel = (e) => {
+      e.preventDefault();
+      applyZoomDelta(e.deltaY);
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, [applyZoomDelta]);
+
+  const visibleCount = Math.max(CHART_MIN_COUNT, Math.round(CHART_BASE_COUNT / zoom));
+
   const view = useMemo(() => {
     if (!candles || !candles.length) return null;
-    const cs = candles.slice(-150);
+    const cs = candles.slice(-visibleCount);
     let lo = Infinity, hi = -Infinity;
     cs.forEach((c) => { lo = Math.min(lo, c.l); hi = Math.max(hi, c.h); });
     cfg.zones.forEach((z) => { lo = Math.min(lo, z.from); hi = Math.max(hi, z.to); });
@@ -408,7 +441,6 @@ function ZoneChart({ cfg, candles, err, live }) {
     const plotW = W - padRight;
     const step = plotW / cs.length;
     const bw = Math.max(1.2, step * 0.62);
-    // Indicadores calculados sobre TODAS las velas (warmup) y recortados a la vista.
     const closes = candles.map((c) => c.c);
     const off = candles.length - cs.length;
     const rsi = rsiSeries(closes, 14).slice(off);
@@ -419,12 +451,24 @@ function ZoneChart({ cfg, candles, err, live }) {
     macd.forEach((v, i) => { maxAbs = Math.max(maxAbs, Math.abs(v), Math.abs(signal[i]), Math.abs(hist[i])); });
     if (!maxAbs) maxAbs = 1;
     return { cs, lo, hi, y, step, bw, plotW, rsi, rsiMa, macd, signal, hist, maxAbs };
-  }, [candles, cfg, live]);
+  }, [candles, cfg, live, visibleCount]);
+
+  const onTouchStart = (e) => {
+    touchRef.current = { y: e.touches[0].clientY, zoom };
+  };
+  const onTouchMove = (e) => {
+    if (!touchRef.current) return;
+    const dy = e.touches[0].clientY - touchRef.current.y;
+    if (Math.abs(dy) < 18) return;
+    applyZoomDelta(dy > 0 ? 1 : -1);
+    touchRef.current = { y: e.touches[0].clientY, zoom };
+  };
+  const onTouchEnd = () => { touchRef.current = null; };
 
   if (err) return (
     <div className="grid place-items-center text-center text-xs text-rose-300 py-16 px-4">
-      No se pudieron cargar velas en vivo (Binance bloqueado o sin red). Las zonas siguen abajo.
-      <ZoneList cfg={cfg} />
+      No se pudieron cargar velas en vivo (Binance bloqueado o sin red).
+      {cfg.zones.length > 0 && <ZoneList cfg={cfg} />}
     </div>
   );
   if (!view) return (
@@ -449,132 +493,161 @@ function ZoneChart({ cfg, candles, err, live }) {
   const fmtP = (p) => (p >= 1000 ? Math.round(p).toLocaleString() : p.toFixed(0));
 
   return (
-    <svg viewBox={`0 0 ${W} ${H_TOT}`} className="w-full" style={{ display: "block" }}>
-      {/* gridlines + price axis */}
-      {Array.from({ length: ticks + 1 }).map((_, i) => {
-        const p = lo + ((hi - lo) * i) / ticks;
-        const yy = y(p);
-        return (
-          <g key={i}>
-            <line x1={0} x2={plotW} y1={yy} y2={yy} stroke="#1e293b" strokeWidth="1" />
-            <text x={plotW + 6} y={yy + 3} fill="#64748b" fontSize="10" fontFamily="monospace">
-              {p >= 1000 ? Math.round(p).toLocaleString() : p.toFixed(0)}
-            </text>
-          </g>
-        );
-      })}
-      {/* zones (con precios y hover) */}
-      {cfg.zones.map((z, i) => {
-        const yt = y(z.to), yb = y(z.from);
-        const hovered = hover === i;
-        return (
-          <g key={"z" + i}>
-            <rect
-              x={0} y={yt} width={plotW} height={Math.max(2, yb - yt)}
-              fill={zoneColor(z.kind, hovered)}
-              stroke={hovered ? zoneStroke(z.kind) : "none"} strokeWidth="1"
-              style={{ cursor: "pointer" }}
-              onMouseEnter={() => setHover(i)}
-              onMouseLeave={() => setHover(null)}
-            />
-            <text x={6} y={yt + 12} fill={z.kind === "target" ? "#6ee7b7" : "#7dd3fc"} fontSize="10" fontFamily="monospace" pointerEvents="none">
-              {z.label} · {fmtP(z.from)}–{fmtP(z.to)}
-            </text>
-          </g>
-        );
-      })}
-      {/* candles */}
-      {cs.map((c, i) => {
-        const x = i * step + step / 2;
-        const up = c.c >= c.o;
-        const col = up ? "#34d399" : "#f87171";
-        const yo = y(c.o), yc = y(c.c);
-        return (
-          <g key={i}>
-            <line x1={x} x2={x} y1={y(c.h)} y2={y(c.l)} stroke={col} strokeWidth="1" />
-            <rect x={x - bw / 2} y={Math.min(yo, yc)} width={bw} height={Math.max(1, Math.abs(yc - yo))} fill={col} />
-          </g>
-        );
-      })}
-      {/* lines */}
-      {cfg.lines.map((l, i) => (
-        <g key={"l" + i}>
-          <line x1={0} x2={plotW} y1={y(l.price)} y2={y(l.price)} stroke={lineColor(l.kind)} strokeWidth="1" strokeDasharray="5 4" />
-          <text x={plotW - 4} y={y(l.price) - 3} textAnchor="end" fill={lineColor(l.kind)} fontSize="10" fontFamily="monospace">
-            {l.label} {Math.round(l.price).toLocaleString()}
-          </text>
-        </g>
-      ))}
-      {/* live price */}
-      {live && (
-        <g>
-          <line x1={0} x2={plotW} y1={y(live)} y2={y(live)} stroke="#e2e8f0" strokeWidth="1" />
-          <rect x={plotW} y={y(live) - 8} width={padRight} height={16} fill="#e2e8f0" />
-          <text x={plotW + 4} y={y(live) + 3} fill="#0f172a" fontSize="10" fontWeight="700" fontFamily="monospace">
-            {Math.round(live).toLocaleString()}
-          </text>
-        </g>
+    <div
+      ref={wrapRef}
+      className="relative touch-none select-none"
+      onTouchStart={onTouchStart}
+      onTouchMove={onTouchMove}
+      onTouchEnd={onTouchEnd}
+    >
+      {zoom > 1 && (
+        <div className="absolute top-1 right-2 z-10 text-[9px] font-mono text-violet-300 bg-slate-950/80 px-1.5 py-0.5 rounded border border-violet-500/30">
+          zoom {zoom.toFixed(1)}× · {visibleCount} velas
+        </div>
       )}
-      {/* tooltip de zona en hover */}
-      {hover != null && cfg.zones[hover] && (() => {
-        const z = cfg.zones[hover];
-        const txt = `${z.label}: ${fmtP(z.from)} – ${fmtP(z.to)}`;
-        const dist = live ? ` · dist ${(((z.from + z.to) / 2 - live) / live * 100).toFixed(1)}%` : "";
-        const full = txt + dist;
-        const tw = full.length * 6.3 + 18;
-        const ty = Math.max(padTop + 2, Math.min(y(z.to) + 8, PRICE_H - padBot - 26));
-        return (
-          <g pointerEvents="none">
-            <rect x={8} y={ty} width={tw} height={20} rx={4} fill="#0f172a" stroke={zoneStroke(z.kind)} strokeWidth="1" opacity="0.95" />
-            <text x={17} y={ty + 13.5} fill="#e2e8f0" fontSize="10" fontFamily="monospace">{full}</text>
-          </g>
-        );
-      })()}
-
-      {/* ── panel RSI 14 + media 14 ── */}
-      <g>
-        <rect x={0} y={RSI_TOP} width={plotW} height={IND_H} fill="rgba(167,139,250,0.06)" />
-        <rect x={0} y={rsiY(70)} width={plotW} height={rsiY(30) - rsiY(70)} fill="rgba(148,163,184,0.07)" />
-        {[70, 50, 30].map((v) => (
-          <g key={v}>
-            <line x1={0} x2={plotW} y1={rsiY(v)} y2={rsiY(v)} stroke="#334155" strokeWidth="1" strokeDasharray={v === 50 ? "2 4" : "4 4"} />
-            <text x={plotW + 6} y={rsiY(v) + 3} fill="#64748b" fontSize="9" fontFamily="monospace">{v}</text>
+      <svg viewBox={`0 0 ${W} ${H_TOT}`} className="w-full" style={{ display: "block" }}>
+        {Array.from({ length: ticks + 1 }).map((_, i) => {
+          const p = lo + ((hi - lo) * i) / ticks;
+          const yy = y(p);
+          return (
+            <g key={i}>
+              <line x1={0} x2={plotW} y1={yy} y2={yy} stroke="#1e293b" strokeWidth="1" />
+              <text x={plotW + 6} y={yy + 3} fill="#64748b" fontSize="10" fontFamily="monospace">
+                {p >= 1000 ? Math.round(p).toLocaleString() : p.toFixed(0)}
+              </text>
+            </g>
+          );
+        })}
+        {cfg.zones.map((z, i) => {
+          const yt = y(z.to), yb = y(z.from);
+          const hovered = hover === i;
+          return (
+            <g key={"z" + i}>
+              <rect
+                x={0} y={yt} width={plotW} height={Math.max(2, yb - yt)}
+                fill={zoneColor(z.kind, hovered)}
+                stroke={hovered ? zoneStroke(z.kind) : "none"} strokeWidth="1"
+                style={{ cursor: "pointer" }}
+                onMouseEnter={() => setHover(i)}
+                onMouseLeave={() => setHover(null)}
+              />
+              <text x={6} y={yt + 12} fill={z.kind === "target" ? "#6ee7b7" : "#7dd3fc"} fontSize="10" fontFamily="monospace" pointerEvents="none">
+                {z.label} · {fmtP(z.from)}–{fmtP(z.to)}
+              </text>
+            </g>
+          );
+        })}
+        {cs.map((c, i) => {
+          const x = i * step + step / 2;
+          const up = c.c >= c.o;
+          const col = up ? "#34d399" : "#f87171";
+          const yo = y(c.o), yc = y(c.c);
+          const hitW = Math.max(bw + 2, step * 0.85);
+          return (
+            <g key={i}>
+              <rect
+                x={x - hitW / 2} y={padTop} width={hitW} height={PRICE_H - padTop - padBot}
+                fill="transparent"
+                onMouseEnter={() => setCandleHover(i)}
+                onMouseLeave={() => setCandleHover(null)}
+              />
+              <line x1={x} x2={x} y1={y(c.h)} y2={y(c.l)} stroke={col} strokeWidth="1" />
+              <rect x={x - bw / 2} y={Math.min(yo, yc)} width={bw} height={Math.max(1, Math.abs(yc - yo))} fill={col} pointerEvents="none" />
+            </g>
+          );
+        })}
+        {cfg.lines.map((l, i) => (
+          <g key={"l" + i}>
+            <line x1={0} x2={plotW} y1={y(l.price)} y2={y(l.price)} stroke={lineColor(l.kind)} strokeWidth="1" strokeDasharray="5 4" />
+            <text x={plotW - 4} y={y(l.price) - 3} textAnchor="end" fill={lineColor(l.kind)} fontSize="10" fontFamily="monospace">
+              {l.label} {Math.round(l.price).toLocaleString()}
+            </text>
           </g>
         ))}
-        <polyline points={toPoints(rsi, rsiY)} fill="none" stroke="#a78bfa" strokeWidth="1.3" />
-        <polyline points={toPoints(rsiMa, rsiY)} fill="none" stroke="#eab308" strokeWidth="1" />
-        <text x={6} y={RSI_TOP + 11} fill="#a78bfa" fontSize="10" fontFamily="monospace">
-          RSI 14 {lastVal(rsi) != null ? lastVal(rsi).toFixed(1) : ""}
-        </text>
-        <text x={110} y={RSI_TOP + 11} fill="#eab308" fontSize="10" fontFamily="monospace">
-          media 14 {lastVal(rsiMa) != null ? lastVal(rsiMa).toFixed(1) : ""}
-        </text>
-      </g>
+        {live && (
+          <g>
+            <line x1={0} x2={plotW} y1={y(live)} y2={y(live)} stroke="#e2e8f0" strokeWidth="1" />
+            <rect x={plotW} y={y(live) - 8} width={padRight} height={16} fill="#e2e8f0" />
+            <text x={plotW + 4} y={y(live) + 3} fill="#0f172a" fontSize="10" fontWeight="700" fontFamily="monospace">
+              {Math.round(live).toLocaleString()}
+            </text>
+          </g>
+        )}
+        {hover != null && cfg.zones[hover] && (() => {
+          const z = cfg.zones[hover];
+          const txt = `${z.label}: ${fmtP(z.from)} – ${fmtP(z.to)}`;
+          const dist = live ? ` · dist ${(((z.from + z.to) / 2 - live) / live * 100).toFixed(1)}%` : "";
+          const full = txt + dist;
+          const tw = full.length * 6.3 + 18;
+          const ty = Math.max(padTop + 2, Math.min(y(z.to) + 8, PRICE_H - padBot - 26));
+          return (
+            <g pointerEvents="none">
+              <rect x={8} y={ty} width={tw} height={20} rx={4} fill="#0f172a" stroke={zoneStroke(z.kind)} strokeWidth="1" opacity="0.95" />
+              <text x={17} y={ty + 13.5} fill="#e2e8f0" fontSize="10" fontFamily="monospace">{full}</text>
+            </g>
+          );
+        })()}
+        {candleHover != null && cs[candleHover]?.t && (() => {
+          const c = cs[candleHover];
+          const label = fmtCandleTime(c.t, interval);
+          const x = xAt(candleHover);
+          const tw = label.length * 6.5 + 16;
+          const tx = Math.max(4, Math.min(x - tw / 2, plotW - tw - 4));
+          return (
+            <g pointerEvents="none">
+              <line x1={x} x2={x} y1={PRICE_H - padBot} y2={PRICE_H - 2} stroke="#94a3b8" strokeWidth="1" strokeDasharray="2 2" />
+              <rect x={tx} y={PRICE_H - padBot + 2} width={tw} height={18} rx={3} fill="#0f172a" stroke="#475569" strokeWidth="1" opacity="0.95" />
+              <text x={tx + 8} y={PRICE_H - padBot + 14} fill="#e2e8f0" fontSize="10" fontFamily="monospace">{label}</text>
+            </g>
+          );
+        })()}
 
-      {/* ── panel MACD 12·26·9 ── */}
-      <g>
-        <rect x={0} y={MACD_TOP} width={plotW} height={IND_H} fill="rgba(96,165,250,0.05)" />
-        <line x1={0} x2={plotW} y1={macdMid} y2={macdMid} stroke="#334155" strokeWidth="1" />
-        {hist.map((v, i) => (
-          <rect
-            key={i}
-            x={xAt(i) - bw / 2}
-            y={v >= 0 ? macdY(v) : macdMid}
-            width={bw}
-            height={Math.max(0.5, Math.abs(macdY(v) - macdMid))}
-            fill={v >= 0 ? "rgba(52,211,153,0.55)" : "rgba(248,113,113,0.55)"}
-          />
-        ))}
-        <polyline points={toPoints(macd, macdY)} fill="none" stroke="#60a5fa" strokeWidth="1.3" />
-        <polyline points={toPoints(signal, macdY)} fill="none" stroke="#fb923c" strokeWidth="1" />
-        <text x={6} y={MACD_TOP + 11} fill="#60a5fa" fontSize="10" fontFamily="monospace">
-          MACD 12·26·9 {lastVal(macd) != null ? lastVal(macd).toFixed(lastVal(macd) >= 100 ? 0 : 2) : ""}
-        </text>
-        <text x={160} y={MACD_TOP + 11} fill="#fb923c" fontSize="10" fontFamily="monospace">
-          señal {lastVal(signal) != null ? lastVal(signal).toFixed(lastVal(signal) >= 100 ? 0 : 2) : ""}
-        </text>
-      </g>
-    </svg>
+        <g>
+          <rect x={0} y={RSI_TOP} width={plotW} height={IND_H} fill="rgba(167,139,250,0.06)" />
+          <rect x={0} y={rsiY(70)} width={plotW} height={rsiY(30) - rsiY(70)} fill="rgba(148,163,184,0.07)" />
+          {[70, 50, 30].map((v) => (
+            <g key={v}>
+              <line x1={0} x2={plotW} y1={rsiY(v)} y2={rsiY(v)} stroke="#334155" strokeWidth="1" strokeDasharray={v === 50 ? "2 4" : "4 4"} />
+              <text x={plotW + 6} y={rsiY(v) + 3} fill="#64748b" fontSize="9" fontFamily="monospace">{v}</text>
+            </g>
+          ))}
+          <polyline points={toPoints(rsi, rsiY)} fill="none" stroke="#a78bfa" strokeWidth="1.3" />
+          <polyline points={toPoints(rsiMa, rsiY)} fill="none" stroke="#eab308" strokeWidth="1" />
+          <text x={6} y={RSI_TOP + 11} fill="#a78bfa" fontSize="10" fontFamily="monospace">
+            RSI 14 {lastVal(rsi) != null ? lastVal(rsi).toFixed(1) : ""}
+          </text>
+          <text x={110} y={RSI_TOP + 11} fill="#eab308" fontSize="10" fontFamily="monospace">
+            media 14 {lastVal(rsiMa) != null ? lastVal(rsiMa).toFixed(1) : ""}
+          </text>
+        </g>
+
+        <g>
+          <rect x={0} y={MACD_TOP} width={plotW} height={IND_H} fill="rgba(96,165,250,0.05)" />
+          <line x1={0} x2={plotW} y1={macdMid} y2={macdMid} stroke="#334155" strokeWidth="1" />
+          {hist.map((v, i) => (
+            <rect
+              key={i}
+              x={xAt(i) - bw / 2}
+              y={v >= 0 ? macdY(v) : macdMid}
+              width={bw}
+              height={Math.max(0.5, Math.abs(macdY(v) - macdMid))}
+              fill={v >= 0 ? "rgba(52,211,153,0.55)" : "rgba(248,113,113,0.55)"}
+            />
+          ))}
+          <polyline points={toPoints(macd, macdY)} fill="none" stroke="#60a5fa" strokeWidth="1.3" />
+          <polyline points={toPoints(signal, macdY)} fill="none" stroke="#fb923c" strokeWidth="1" />
+          <text x={6} y={MACD_TOP + 11} fill="#60a5fa" fontSize="10" fontFamily="monospace">
+            MACD 12·26·9 {lastVal(macd) != null ? lastVal(macd).toFixed(lastVal(macd) >= 100 ? 0 : 2) : ""}
+          </text>
+          <text x={160} y={MACD_TOP + 11} fill="#fb923c" fontSize="10" fontFamily="monospace">
+            señal {lastVal(signal) != null ? lastVal(signal).toFixed(lastVal(signal) >= 100 ? 0 : 2) : ""}
+          </text>
+        </g>
+      </svg>
+      <p className="px-2 pb-2 text-[10px] text-slate-500 font-mono">
+        Desliza ↓ o rueda ↓ para ampliar · ↑ para volver · pasa el cursor sobre una vela para ver la fecha
+      </p>
+    </div>
   );
 }
 
@@ -590,7 +663,7 @@ function ZoneList({ cfg }) {
   );
 }
 
-function ChartCard({ symbol, cfg, live, aiTag }) {
+function ChartCard({ symbol, cfg, live, aiTag, zonesPending }) {
   const [iv, setIv] = useState("1d");
   const { candles, err } = useKlines(symbol, iv);
   return (
@@ -606,6 +679,11 @@ function ChartCard({ symbol, cfg, live, aiTag }) {
           {aiTag && (
             <span className="text-[9px] font-mono px-1.5 py-0.5 rounded-full border border-violet-500/40 bg-violet-500/10 text-violet-300">
               zonas IA
+            </span>
+          )}
+          {zonesPending && (
+            <span className="text-[9px] font-mono px-1.5 py-0.5 rounded-full border border-slate-600 text-slate-400 animate-pulse">
+              calculando…
             </span>
           )}
         </div>
@@ -625,7 +703,7 @@ function ChartCard({ symbol, cfg, live, aiTag }) {
       {cfg.comment && (
         <p className="px-3 py-1.5 text-[11px] text-slate-400 border-b border-slate-700/60">{cfg.comment}</p>
       )}
-      <ZoneChart cfg={cfg} candles={candles} err={err} live={live} />
+      <ZoneChart cfg={cfg} candles={candles} err={err} live={live} interval={iv} />
     </div>
   );
 }
@@ -646,42 +724,109 @@ function LocalClock() {
 }
 
 // ───────────────────────── calendario económico ────────────────────────────
-// Exness bloquea el iframe (x-frame-options: SAMEORIGIN). TradingView ofrece
-// el mismo calendario como widget embebible gratuito.
+function ImpactIcon({ impact }) {
+  const level = (impact || "Low").toLowerCase();
+  const bars = level === "high" ? 3 : level === "medium" ? 2 : 1;
+  const color = level === "high" ? "bg-rose-500" : level === "medium" ? "bg-amber-400" : "bg-slate-500";
+  const title = level === "high" ? "Alto impacto" : level === "medium" ? "Impacto medio" : "Bajo impacto";
+  return (
+    <span className="inline-flex items-end gap-0.5 h-4" title={title}>
+      {Array.from({ length: bars }).map((_, i) => (
+        <span key={i} className={`w-1 rounded-sm ${color}`} style={{ height: 6 + i * 4 }} />
+      ))}
+      {level === "low" && Array.from({ length: 2 }).map((_, i) => (
+        <span key={"e" + i} className="w-1 rounded-sm bg-slate-700" style={{ height: 6 }} />
+      ))}
+    </span>
+  );
+}
+
+function useEconomicCalendar() {
+  const [events, setEvents] = useState(null);
+  const [err, setErr] = useState(false);
+  useEffect(() => {
+    let live = true;
+    const load = async () => {
+      try {
+        const j = await fetchJSON("/.netlify/functions/calendar", 15000);
+        if (live && j?.events) { setEvents(j.events); setErr(false); }
+      } catch { if (live) setErr(true); }
+    };
+    load();
+    const t = setInterval(load, 3600000);
+    return () => { live = false; clearInterval(t); };
+  }, []);
+  return { events, err };
+}
+
 function EconomicCalendar() {
-  const src =
-    "https://s.tradingview.com/embed-widget/events/?locale=es#" +
-    encodeURIComponent(JSON.stringify({
-      colorTheme: "dark",
-      isTransparent: true,
-      width: "100%",
-      height: 450,
-      importanceFilter: "0,1",
-    }));
+  const { events, err } = useEconomicCalendar();
+  const grouped = useMemo(() => {
+    if (!events?.length) return [];
+    const map = new Map();
+    events.forEach((e) => {
+      const day = new Date(e.date).toLocaleDateString("es", { weekday: "long", day: "numeric", month: "long" });
+      if (!map.has(day)) map.set(day, []);
+      map.get(day).push(e);
+    });
+    return [...map.entries()];
+  }, [events]);
+
   return (
     <section className="rounded-xl border border-slate-700/60 bg-slate-900/60 p-4">
       <div className="flex items-center gap-2 mb-3">
         <Calendar size={16} className="text-slate-300" />
-        <h2 className="text-sm font-mono tracking-wide text-slate-300">Calendario económico (TradingView)</h2>
+        <h2 className="text-sm font-mono tracking-wide text-slate-300">Calendario económico</h2>
       </div>
-      <iframe
-        src={src}
-        title="Calendario económico"
-        className="w-full rounded-md border border-slate-700"
-        style={{ height: 450, border: 0 }}
-      />
-      <p className="mt-2 text-[11px] text-slate-500">Eventos de impacto medio y alto. Antes de CPI/FOMC: manos quietas.</p>
+      {err && !events && (
+        <p className="text-xs text-rose-300">No se pudo cargar el calendario.</p>
+      )}
+      {!events && !err && (
+        <p className="text-xs text-slate-500">Cargando eventos de la semana…</p>
+      )}
+      {grouped.length > 0 && (
+        <div className="max-h-[450px] overflow-y-auto rounded-md border border-slate-700/60">
+          {grouped.map(([day, evs]) => (
+            <div key={day}>
+              <div className="sticky top-0 z-10 bg-slate-900/95 px-3 py-2 text-xs font-mono uppercase tracking-wider text-slate-400 border-b border-slate-700/60">
+                {day}
+              </div>
+              <table className="w-full text-left text-xs">
+                <tbody>
+                  {evs.map((e, i) => (
+                    <tr key={i} className="border-b border-slate-800/80 hover:bg-slate-800/40">
+                      <td className="py-2 pl-3 pr-2 font-mono text-slate-400 whitespace-nowrap w-16">
+                        {new Date(e.date).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                      </td>
+                      <td className="py-2 px-2 w-10 font-mono text-slate-500">{e.country}</td>
+                      <td className="py-2 px-2 w-12"><ImpactIcon impact={e.impact} /></td>
+                      <td className="py-2 px-2 text-slate-200">{e.title}</td>
+                      <td className="py-2 px-2 font-mono text-slate-400 text-right hidden sm:table-cell">{e.forecast || "—"}</td>
+                      <td className="py-2 pr-3 pl-2 font-mono text-slate-500 text-right hidden sm:table-cell">{e.previous || "—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ))}
+        </div>
+      )}
+      <p className="mt-2 text-[11px] text-slate-500">Antes de CPI/FOMC: manos quietas. Iconos: rojo = alto · ámbar = medio · gris = bajo.</p>
     </section>
   );
 }
 
 // ───────────────────────── diagnóstico dinámico ────────────────────────────
-function Diagnosis({ btc, fg, etf, onchain, ai, cfg = ASSETS.BTCUSDT }) {
+function Diagnosis({ btc, fg, etf, onchain, ai, cfg = ASSETS.BTCUSDT, zonesLoading }) {
   const bullets = [];
   let verdict, vtone;
+  const hasZones = cfg.poi && cfg.invalidation != null;
 
   if (btc == null) {
     verdict = "Sin precio en vivo — diagnóstico en pausa.";
+    vtone = "warn";
+  } else if (zonesLoading || !hasZones) {
+    verdict = "Calculando zonas y diagnóstico dinámicos (IA)…";
     vtone = "warn";
   } else if (btc < cfg.invalidation) {
     verdict = "INVALIDACIÓN: tesis de acumulación rota. Sin long.";
@@ -742,6 +887,8 @@ function Diagnosis({ btc, fg, etf, onchain, ai, cfg = ASSETS.BTCUSDT }) {
       </div>
       {ai?.text ? (
         <div className="mt-3 text-xs text-slate-300 whitespace-pre-wrap leading-relaxed">{ai.text}</div>
+      ) : zonesLoading || !hasZones ? (
+        <p className="mt-3 text-xs text-slate-500">Esperando análisis de Gemini Pro con velas y contexto en vivo…</p>
       ) : (
         <ul className="mt-3 space-y-1.5">
           {bullets.map((b, i) => (
@@ -756,34 +903,30 @@ function Diagnosis({ btc, fg, etf, onchain, ai, cfg = ASSETS.BTCUSDT }) {
 }
 
 // ───────────────────────── playbook de posiciones ──────────────────────────
-// Escenarios condicionados a estructura — NO son señales. Derivados de las
-// zonas de ASSETS (POI, invalidación, imanes). Todo pasa por el filtro R:R.
-const PLAYBOOK = [
-  {
-    horizon: "Semanal",
-    ideas: [
-      { asset: "BTC", side: "Long swing", entry: "POI 58,000–60,000", stop: "54,500", target: "65,000–68,000", rr: "≈1.6–2.0", cond: "Solo con CHoCH confirmado en 4H dentro del POI. Sin confirmación, no hay trade." },
-      { asset: "ETH", side: "Long swing", entry: "POI 1,500–1,550", stop: "1,400", target: "1,750–1,850", rr: "≈1.8–2.4", cond: "Reacción visible en el POI y BTC sosteniendo el suyo." },
-    ],
-  },
-  {
-    horizon: "Mensual",
-    ideas: [
-      { asset: "BTC", side: "Long posición", entry: "Limits escalonados 58,000–60,000", stop: "54,500", target: "Imán 80,000–85,000", rr: "≈4.5–5.5", cond: "La semanal debe dejar de hacer mínimos decrecientes; flujos ETF en reversión." },
-      { asset: "ETH", side: "Long posición", entry: "POI 1,500–1,550", stop: "1,400", target: "Imán 2,400–2,500", rr: "≈7–8", cond: "ETH sigue a BTC: sin BTC constructivo no se abre." },
-    ],
-  },
-  {
-    horizon: "Anual",
-    ideas: [
-      { asset: "BTC", side: "Acumulación", entry: "Escalonada 54,500–60,000", stop: "Cierre semanal bajo 54,500", target: "85,000+ (reevaluar en el imán)", rr: "—", cond: "Tesis on-chain: MVRV-Z < 1, Puell < 1, Cycle Top 0/30. Si cambia, se reevalúa." },
-      { asset: "ETH", side: "Acumulación", entry: "Escalonada 1,400–1,550", stop: "Cierre semanal bajo 1,400", target: "2,500+ (vigilar dominancia)", rr: "—", cond: "Mientras NO haya altseason y ETH/BTC no rompa a la baja." },
-    ],
-  },
-];
-
-function Playbook({ data, aiModel }) {
-  const rows = data?.length ? data : PLAYBOOK;
+function Playbook({ data, aiModel, loading }) {
+  if (loading && !data?.length) {
+    return (
+      <section className="rounded-xl border border-slate-700/60 bg-slate-900/60 p-4">
+        <div className="flex items-center gap-2 mb-3">
+          <Target size={16} className="text-slate-300" />
+          <h2 className="text-sm font-mono tracking-wide text-slate-300">Posibles posiciones — semanal · mensual · anual</h2>
+        </div>
+        <p className="text-xs text-slate-500">Generando escenarios dinámicos a partir de la estructura actual…</p>
+      </section>
+    );
+  }
+  if (!data?.length) {
+    return (
+      <section className="rounded-xl border border-slate-700/60 bg-slate-900/60 p-4">
+        <div className="flex items-center gap-2 mb-3">
+          <Target size={16} className="text-slate-300" />
+          <h2 className="text-sm font-mono tracking-wide text-slate-300">Posibles posiciones — semanal · mensual · anual</h2>
+        </div>
+        <p className="text-xs text-slate-500">Sin playbook IA disponible. Revisa la key de Gemini en Netlify.</p>
+      </section>
+    );
+  }
+  const rows = data;
   return (
     <section className="rounded-xl border border-slate-700/60 bg-slate-900/60 p-4">
       <div className="flex items-center justify-between gap-2 mb-1">
@@ -930,8 +1073,8 @@ export default function Cockpit() {
   // Contexto completo para la IA — siempre con el último estado.
   const ctxRef = useRef(null);
   const ready = status === "live" && btc != null;
-  const ai = useAiDiagnosis(ready, ctxRef);
-  const aiZones = useAiZones(ready, ctxRef);
+  const { data: aiZones, loading: zonesLoading } = useAiZones(ready, ctxRef);
+  const ai = useAiDiagnosis(ready, ctxRef, aiZones);
   ctxRef.current = {
     precios: { btc, eth, sol },
     cambio24h: {
@@ -1020,16 +1163,30 @@ export default function Cockpit() {
 
         {/* charts con zonas */}
         <section className="grid gap-4 lg:grid-cols-3">
-          <ChartCard symbol="BTCUSDT" cfg={mergedAssets.BTCUSDT} live={btc} aiTag={!!aiZones?.zones?.BTCUSDT} />
-          <ChartCard symbol="ETHUSDT" cfg={mergedAssets.ETHUSDT} live={eth} aiTag={!!aiZones?.zones?.ETHUSDT} />
-          <ChartCard symbol="SOLUSDT" cfg={mergedAssets.SOLUSDT} live={sol} aiTag={!!aiZones?.zones?.SOLUSDT} />
+          <ChartCard symbol="BTCUSDT" cfg={mergedAssets.BTCUSDT} live={btc} aiTag={!!aiZones?.zones?.BTCUSDT} zonesPending={zonesLoading && !mergedAssets.BTCUSDT.zones.length} />
+          <ChartCard symbol="ETHUSDT" cfg={mergedAssets.ETHUSDT} live={eth} aiTag={!!aiZones?.zones?.ETHUSDT} zonesPending={zonesLoading && !mergedAssets.ETHUSDT.zones.length} />
+          <ChartCard symbol="SOLUSDT" cfg={mergedAssets.SOLUSDT} live={sol} aiTag={!!aiZones?.zones?.SOLUSDT} zonesPending={zonesLoading && !mergedAssets.SOLUSDT.zones.length} />
         </section>
 
         <EconomicCalendar />
 
-        <Diagnosis btc={btc} fg={fg} etf={etf} onchain={onchain} ai={ai} cfg={mergedAssets.BTCUSDT} />
+        <Diagnosis btc={btc} fg={fg} etf={etf} onchain={onchain} ai={ai} cfg={mergedAssets.BTCUSDT} zonesLoading={zonesLoading} />
 
-        <Playbook data={aiZones?.playbook} aiModel={aiZones?.model} />
+        <RiskPortfolioManager
+          btc={btc}
+          eth={eth}
+          btcChange={prices.BTCUSDT?.change ?? null}
+          ethChange={prices.ETHUSDT?.change ?? null}
+          fg={fg}
+          etf={etf}
+          derivs={derivs}
+          onchain={onchain}
+          daily={daily}
+          btcCfg={mergedAssets.BTCUSDT}
+          ethCfg={mergedAssets.ETHUSDT}
+        />
+
+        <Playbook data={aiZones?.playbook} aiModel={aiZones?.model} loading={zonesLoading} />
 
         {/* indicadores: live vs snapshot, separados y honestos */}
         <section className="rounded-xl border border-slate-700/60 bg-slate-900/60 p-4">

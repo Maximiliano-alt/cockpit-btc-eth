@@ -1,12 +1,11 @@
 // Análisis de zonas dinámico por LLM. El cliente manda las últimas velas
 // diarias de cada activo + contexto; el modelo devuelve zonas (imán de
 // liquidez, POI) y línea de invalidación derivadas de la estructura real.
-// Gratis con Gemini (tier free); usa Anthropic solo si hay key configurada.
-// Cache 4 h — es análisis HTF, no necesita refrescarse más seguido.
-let cache = { at: 0, body: null };
+// Gemini Pro; cache 4 h por día + precios redondeados.
+let cache = { at: 0, key: null, body: null };
 const TTL = 4 * 60 * 60 * 1000;
 
-const GEMINI_MODEL = "gemini-3.5-flash";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.1-pro-preview";
 
 const SYSTEM =
   "Eres un analista técnico institucional (SMC/Wyckoff) de criptomonedas. " +
@@ -28,7 +27,19 @@ const SYSTEM =
 
 function num(v) { return typeof v === "number" && isFinite(v) ? v : null; }
 
-// El LLM puede alucinar el esquema: se valida campo por campo y se descarta lo inválido.
+function cacheKey(body) {
+  try {
+    const j = JSON.parse(body || "{}");
+    const day = new Date().toISOString().slice(0, 10);
+    const prices = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+      .map((s) => Math.round((j.assets?.[s]?.price || 0) / 100) * 100)
+      .join("|");
+    return `${day}|${prices}`;
+  } catch {
+    return String(Date.now());
+  }
+}
+
 function sanitize(raw) {
   const out = {};
   for (const sym of ["BTCUSDT", "ETHUSDT", "SOLUSDT"]) {
@@ -86,7 +97,7 @@ async function callGemini(key, user) {
       body: JSON.stringify({
         system_instruction: { parts: [{ text: SYSTEM }] },
         contents: [{ role: "user", parts: [{ text: user }] }],
-        generationConfig: { maxOutputTokens: 4096, temperature: 0.3, responseMimeType: "application/json" },
+        generationConfig: { maxOutputTokens: 8192, temperature: 0.25, responseMimeType: "application/json" },
       }),
     }
   );
@@ -115,7 +126,8 @@ exports.handler = async (event) => {
   if (event.httpMethod !== "POST") {
     return { statusCode: 405, body: "Method Not Allowed" };
   }
-  if (cache.body && Date.now() - cache.at < TTL) {
+  const ck = cacheKey(event.body);
+  if (cache.body && cache.key === ck && Date.now() - cache.at < TTL) {
     return { statusCode: 200, body: cache.body };
   }
   const gemini = process.env.GEMINI_API_KEY;
@@ -127,14 +139,13 @@ exports.handler = async (event) => {
     const ctx = JSON.parse(event.body || "{}");
     const user = "Datos por activo y contexto:\n" + JSON.stringify(ctx);
     const text = gemini ? await callGemini(gemini, user) : await callAnthropic(anthropic, user);
-    // El modelo puede envolver el JSON en texto/markdown: extraer el primer bloque {...}.
     const m = text.match(/\{[\s\S]*\}/);
     const parsed = JSON.parse(m ? m[0] : text);
     const zones = sanitize(parsed);
     const playbook = sanitizePlaybook(parsed.playbook);
     if (!Object.keys(zones).length) throw new Error("respuesta sin zonas válidas");
     const body = JSON.stringify({ zones, playbook, model: gemini ? GEMINI_MODEL : "claude-sonnet-4-6", at: Date.now() });
-    cache = { at: Date.now(), body };
+    cache = { at: Date.now(), key: ck, body };
     return { statusCode: 200, body };
   } catch (e) {
     return { statusCode: 500, body: JSON.stringify({ error: String(e) }) };

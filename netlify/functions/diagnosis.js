@@ -1,25 +1,38 @@
 // Diagnóstico generado por LLM con el contexto completo del dashboard.
-// Gratis con Gemini (tier free, sin tarjeta); usa Anthropic solo si hay key.
-// Cache 15 min en memoria: aunque haya varias pestañas o recargas, se gasta
-// como máximo ~4 requests/hora. Las API keys viven solo en el server.
-let cache = { at: 0, body: null };
+// Gemini Pro (mejor razonamiento); Anthropic solo si no hay key de Google.
+// Cache 15 min por clave de contexto (precio redondeado + zonas + hora).
+let cache = { at: 0, key: null, body: null };
 const TTL = 15 * 60 * 1000;
 
-const GEMINI_MODEL = "gemini-3.5-flash";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.1-pro-preview";
 
 const SYSTEM =
   "Eres un analista institucional de trading (SMC/Wyckoff + on-chain) escribiendo el diagnóstico del día " +
   "para un dashboard personal de Max. Estilo: directo, sin azúcar, en español. " +
   "Universo operable: solo BTC y ETH (SOL solo se monitorea). " +
   "Recibirás un JSON con datos en vivo: precios, Fear&Greed, dominancia, flujos ETF, funding, open interest, " +
-  "on-chain (Puell, MVRV-Z, Mayer, RSI 22D, Cycle Top, Altseason) y, si están, las zonas vigentes del análisis " +
-  "(zonasIA: imanes de liquidez, POI y línea de invalidación por activo) — usa ESAS zonas como niveles de referencia. " +
-  "Si no vienen zonas, usa: BTC POI 58,000-60,000, invalidación 54,500, imán 80,000-85,000; ETH POI 1,500-1,550, invalidación 1,400, imán 2,400-2,500. " +
+  "on-chain (Puell, MVRV-Z, Mayer, RSI 22D, Cycle Top, Altseason) y las zonas vigentes del análisis " +
+  "(zonasIA: imanes de liquidez, POI y línea de invalidación por activo). " +
+  "OBLIGATORIO: usa EXCLUSIVAMENTE las zonas de zonasIA como niveles de referencia — no inventes números. " +
+  "Si zonasIA es null o vacío, responde que el análisis está pendiente y no des niveles. " +
   "Devuelve SOLO el diagnóstico en este formato, sin preámbulo:\n" +
   "VEREDICTO: una frase contundente sobre qué hacer hoy (gestionar/esperar/actuar) según dónde está el precio vs los niveles.\n" +
   "Luego 4-6 bullets que empiecen con '› ', cada uno interpretando un dato concreto del JSON (precio vs zonas, sentimiento, " +
   "flujos, funding, on-chain). Cita los números. Máximo ~140 palabras en total. " +
   "Nunca recomiendes entrar a mercado sin estructura confirmada; nunca sugieras operar otros activos.";
+
+function cacheKey(body) {
+  try {
+    const j = JSON.parse(body || "{}");
+    const btc = Math.round((j.precios?.btc || 0) / 250) * 250;
+    const eth = Math.round((j.precios?.eth || 0) / 25) * 25;
+    const hour = new Date().toISOString().slice(0, 13);
+    const zones = JSON.stringify(j.zonasIA || null);
+    return `${hour}|${btc}|${eth}|${zones.slice(0, 400)}`;
+  } catch {
+    return String(Date.now());
+  }
+}
 
 async function callGemini(key, user) {
   const res = await fetch(
@@ -30,7 +43,7 @@ async function callGemini(key, user) {
       body: JSON.stringify({
         system_instruction: { parts: [{ text: SYSTEM }] },
         contents: [{ role: "user", parts: [{ text: user }] }],
-        generationConfig: { maxOutputTokens: 2048, temperature: 0.4 },
+        generationConfig: { maxOutputTokens: 2048, temperature: 0.35 },
       }),
     }
   );
@@ -59,7 +72,8 @@ exports.handler = async (event) => {
   if (event.httpMethod !== "POST") {
     return { statusCode: 405, body: "Method Not Allowed" };
   }
-  if (cache.body && Date.now() - cache.at < TTL) {
+  const key = cacheKey(event.body);
+  if (cache.body && cache.key === key && Date.now() - cache.at < TTL) {
     return { statusCode: 200, body: cache.body };
   }
   const gemini = process.env.GEMINI_API_KEY;
@@ -71,7 +85,7 @@ exports.handler = async (event) => {
     const user = "Contexto en vivo:\n" + (event.body || "{}");
     const text = gemini ? await callGemini(gemini, user) : await callAnthropic(anthropic, user);
     const body = JSON.stringify({ text, model: gemini ? GEMINI_MODEL : "claude-sonnet-4-6", at: Date.now() });
-    if (text) cache = { at: Date.now(), body };
+    if (text) cache = { at: Date.now(), key, body };
     return { statusCode: 200, body };
   } catch (e) {
     return { statusCode: 500, body: JSON.stringify({ error: String(e) }) };
