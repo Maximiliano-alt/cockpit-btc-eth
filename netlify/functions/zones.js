@@ -1,11 +1,12 @@
 // Análisis de zonas dinámico por LLM. El cliente manda las últimas velas
 // diarias de cada activo + contexto; el modelo devuelve zonas (imán de
 // liquidez, POI) y línea de invalidación derivadas de la estructura real.
-// Gemini Pro; cache 4 h por día + precios redondeados.
+// Gemini (con fallback automático de modelo si el configurado no tiene cuota);
+// cache 4 h por día + precios redondeados.
+const { callGeminiWithFallback } = require("./_lib/gemini.js");
+
 let cache = { at: 0, key: null, body: null };
 const TTL = 4 * 60 * 60 * 1000;
-
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.1-pro-preview";
 
 const SYSTEM =
   "Eres un analista técnico institucional (SMC/Wyckoff) de criptomonedas. " +
@@ -88,24 +89,6 @@ function sanitizePlaybook(raw) {
   return out.length ? out : null;
 }
 
-async function callGemini(key, user) {
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
-    {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-goog-api-key": key },
-      body: JSON.stringify({
-        system_instruction: { parts: [{ text: SYSTEM }] },
-        contents: [{ role: "user", parts: [{ text: user }] }],
-        generationConfig: { maxOutputTokens: 8192, temperature: 0.25, responseMimeType: "application/json" },
-      }),
-    }
-  );
-  const data = await res.json();
-  if (!res.ok) throw new Error("Gemini HTTP " + res.status + " " + JSON.stringify(data).slice(0, 200));
-  return (data.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("").trim();
-}
-
 async function callAnthropic(key, user) {
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -138,13 +121,28 @@ exports.handler = async (event) => {
   try {
     const ctx = JSON.parse(event.body || "{}");
     const user = "Datos por activo y contexto:\n" + JSON.stringify(ctx);
-    const text = gemini ? await callGemini(gemini, user) : await callAnthropic(anthropic, user);
+    let text, model;
+    if (gemini) {
+      try {
+        const r = await callGeminiWithFallback(gemini, SYSTEM, user, {
+          maxOutputTokens: 8192, temperature: 0.25, responseMimeType: "application/json",
+        });
+        text = r.text; model = r.model;
+      } catch (e) {
+        if (!anthropic) throw e;
+        text = await callAnthropic(anthropic, user);
+        model = "claude-sonnet-4-6";
+      }
+    } else {
+      text = await callAnthropic(anthropic, user);
+      model = "claude-sonnet-4-6";
+    }
     const m = text.match(/\{[\s\S]*\}/);
     const parsed = JSON.parse(m ? m[0] : text);
     const zones = sanitize(parsed);
     const playbook = sanitizePlaybook(parsed.playbook);
     if (!Object.keys(zones).length) throw new Error("respuesta sin zonas válidas");
-    const body = JSON.stringify({ zones, playbook, model: gemini ? GEMINI_MODEL : "claude-sonnet-4-6", at: Date.now() });
+    const body = JSON.stringify({ zones, playbook, model, at: Date.now() });
     cache = { at: Date.now(), key: ck, body };
     return { statusCode: 200, body };
   } catch (e) {

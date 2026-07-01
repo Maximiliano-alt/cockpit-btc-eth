@@ -1,10 +1,11 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import {
-  Lock, AlertTriangle, CheckCircle2, XCircle,
+  Lock, CheckCircle2,
   Calendar, ExternalLink, ShieldAlert, Target, Radio, RefreshCw,
   Stethoscope, Wifi, WifiOff
 } from "lucide-react";
 import RiskPortfolioManager from "./ros/RiskPortfolioManager.jsx";
+import { detectStructure, timeframeBias } from "./ros/structure.js";
 
 // ───────────────────────── CONFIG: activos (zonas vienen de IA) ────────────
 const ASSETS = {
@@ -270,6 +271,56 @@ function useOnchain() {
   return oc;
 }
 
+// Macro (DXY + SP500) vía function server-side (Yahoo Finance, sin key).
+function useMacro() {
+  const [macro, setMacro] = useState(null);
+  useEffect(() => {
+    let live = true;
+    const load = async () => {
+      try {
+        const j = await fetchJSON("/.netlify/functions/macro", 15000);
+        if (live && j) setMacro(j);
+      } catch { /* sin datos */ }
+    };
+    load();
+    const t = setInterval(load, 900000);
+    return () => { live = false; clearInterval(t); };
+  }, []);
+  return macro;
+}
+
+// Estructura técnica de BTC en 4H + sesgo semanal/mensual — alimenta el
+// veredicto del Risk Manager y el diagnóstico IA con "todas las temporalidades".
+function useBtcStructure(btcCfg) {
+  const [structure, setStructure] = useState(null);
+  useEffect(() => {
+    let live = true;
+    const load = async () => {
+      try {
+        const [k4h, k1w, k1M] = await Promise.all([
+          fetchJSON("https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=4h&limit=120"),
+          fetchJSON("https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1w&limit=30"),
+          fetchJSON("https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1M&limit=24"),
+        ]);
+        const toC = (k) => k.map((c) => ({ o: +c[1], h: +c[2], l: +c[3], c: +c[4] }));
+        const c4h = toC(k4h);
+        const base = detectStructure(c4h, btcCfg?.poi?.lo, btcCfg?.invalidation);
+        if (live) {
+          setStructure({
+            ...base,
+            weeklyBullish: timeframeBias(toC(k1w)),
+            monthlyBullish: timeframeBias(toC(k1M)),
+          });
+        }
+      } catch { /* sin estructura */ }
+    };
+    load();
+    const t = setInterval(load, 300000);
+    return () => { live = false; clearInterval(t); };
+  }, [btcCfg?.poi?.lo, btcCfg?.invalidation]);
+  return structure;
+}
+
 // Mayer Multiple (precio / media 200D) y RSI 22D calculados de velas diarias.
 function useBtcDaily() {
   const [s, setS] = useState(null);
@@ -296,10 +347,12 @@ function useBtcDaily() {
 // Diagnóstico IA — solo cuando las zonas dinámicas ya están listas.
 function useAiDiagnosis(online, ctxRef, aiZones) {
   const [ai, setAi] = useState(null);
+  const [aiError, setAiError] = useState(null);
   const zonesReady = !!(aiZones?.zones?.BTCUSDT && aiZones?.zones?.ETHUSDT);
   useEffect(() => {
     if (!online || !zonesReady) return;
     let live = true;
+    let retries = 0;
     const load = async () => {
       try {
         const res = await fetch("/.netlify/functions/diagnosis", {
@@ -307,16 +360,26 @@ function useAiDiagnosis(online, ctxRef, aiZones) {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(ctxRef.current),
         });
-        if (!res.ok) return;
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          if (res.status === 500 && err.error?.includes("API_KEY")) {
+            if (live) setAiError("Sin API keys configuradas. Revisa .env (GEMINI_API_KEY o ANTHROPIC_API_KEY).");
+            return;
+          }
+          if (retries < 2) { retries++; } else { return; }
+          return;
+        }
         const j = await res.json();
-        if (live && j?.text) setAi(j);
-      } catch { /* fallback a reglas */ }
+        if (live && j?.text) { setAi(j); setAiError(null); retries = 0; }
+      } catch (e) {
+        if (retries < 2) { retries++; } else if (live) setAiError("Error al cargar diagnóstico: " + String(e).slice(0, 50));
+      }
     };
     load();
     const t = setInterval(load, 15 * 60 * 1000);
     return () => { live = false; clearInterval(t); };
   }, [online, zonesReady, aiZones?.at, ctxRef]);
-  return ai;
+  return ai || (aiError ? { error: aiError } : null);
 }
 
 // Zonas dinámicas por LLM — reemplazan por completo las zonas estáticas.
@@ -761,28 +824,46 @@ function useEconomicCalendar() {
 
 function EconomicCalendar() {
   const { events, err } = useEconomicCalendar();
-  const grouped = useMemo(() => {
-    if (!events?.length) return [];
+  const nowRowRef = useRef(null);
+  const eventKey = (e) => e.date + "|" + e.title;
+
+  const { grouped, currentKey } = useMemo(() => {
+    if (!events?.length) return { grouped: [], currentKey: null };
+    const now = Date.now();
+    // El evento "del momento": el próximo que aún no pasó (o el último si ya pasaron todos).
+    const next = events.find((e) => new Date(e.date).getTime() >= now);
+    const currentKey = eventKey(next || events[events.length - 1]);
     const map = new Map();
     events.forEach((e) => {
       const day = new Date(e.date).toLocaleDateString("es", { weekday: "long", day: "numeric", month: "long" });
       if (!map.has(day)) map.set(day, []);
       map.get(day).push(e);
     });
-    return [...map.entries()];
+    return { grouped: [...map.entries()], currentKey };
   }, [events]);
+
+  // Al abrir/recargar la página, llevar la vista directo al evento vigente según la hora.
+  useEffect(() => {
+    if (nowRowRef.current) nowRowRef.current.scrollIntoView({ block: "center" });
+  }, [currentKey]);
 
   return (
     <section className="rounded-xl border border-slate-700/60 bg-slate-900/60 p-4">
       <div className="flex items-center gap-2 mb-3">
         <Calendar size={16} className="text-slate-300" />
         <h2 className="text-sm font-mono tracking-wide text-slate-300">Calendario económico</h2>
+        <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border border-slate-600 text-slate-400">
+          solo impacto relevante para cripto
+        </span>
       </div>
       {err && !events && (
         <p className="text-xs text-rose-300">No se pudo cargar el calendario.</p>
       )}
       {!events && !err && (
         <p className="text-xs text-slate-500">Cargando eventos de la semana…</p>
+      )}
+      {events && !events.length && (
+        <p className="text-xs text-slate-500">Sin eventos de alto/medio impacto relevantes esta semana.</p>
       )}
       {grouped.length > 0 && (
         <div className="max-h-[450px] overflow-y-auto rounded-md border border-slate-700/60">
@@ -793,25 +874,38 @@ function EconomicCalendar() {
               </div>
               <table className="w-full text-left text-xs">
                 <tbody>
-                  {evs.map((e, i) => (
-                    <tr key={i} className="border-b border-slate-800/80 hover:bg-slate-800/40">
-                      <td className="py-2 pl-3 pr-2 font-mono text-slate-400 whitespace-nowrap w-16">
-                        {new Date(e.date).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
-                      </td>
-                      <td className="py-2 px-2 w-10 font-mono text-slate-500">{e.country}</td>
-                      <td className="py-2 px-2 w-12"><ImpactIcon impact={e.impact} /></td>
-                      <td className="py-2 px-2 text-slate-200">{e.title}</td>
-                      <td className="py-2 px-2 font-mono text-slate-400 text-right hidden sm:table-cell">{e.forecast || "—"}</td>
-                      <td className="py-2 pr-3 pl-2 font-mono text-slate-500 text-right hidden sm:table-cell">{e.previous || "—"}</td>
-                    </tr>
-                  ))}
+                  {evs.map((e, i) => {
+                    const isCurrent = eventKey(e) === currentKey;
+                    return (
+                      <tr
+                        key={i}
+                        ref={isCurrent ? nowRowRef : null}
+                        className={`border-b border-slate-800/80 hover:bg-slate-800/40 ${
+                          isCurrent ? "bg-violet-500/10 ring-1 ring-inset ring-violet-500/40" : ""
+                        }`}
+                      >
+                        <td className="py-2 pl-3 pr-2 font-mono text-slate-400 whitespace-nowrap w-16">
+                          {isCurrent && <span className="mr-1 inline-block h-1.5 w-1.5 rounded-full bg-violet-400 align-middle animate-pulse" />}
+                          {new Date(e.date).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                        </td>
+                        <td className="py-2 px-2 w-10 font-mono text-slate-500">{e.country}</td>
+                        <td className="py-2 px-2 w-12"><ImpactIcon impact={e.impact} /></td>
+                        <td className={`py-2 px-2 ${isCurrent ? "text-violet-200 font-semibold" : "text-slate-200"}`}>
+                          {e.title}
+                          {isCurrent && <span className="ml-2 text-[9px] font-mono uppercase tracking-wider text-violet-400">ahora</span>}
+                        </td>
+                        <td className="py-2 px-2 font-mono text-slate-400 text-right hidden sm:table-cell">{e.forecast || "—"}</td>
+                        <td className="py-2 pr-3 pl-2 font-mono text-slate-500 text-right hidden sm:table-cell">{e.previous || "—"}</td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
           ))}
         </div>
       )}
-      <p className="mt-2 text-[11px] text-slate-500">Antes de CPI/FOMC: manos quietas. Iconos: rojo = alto · ámbar = medio · gris = bajo.</p>
+      <p className="mt-2 text-[11px] text-slate-500">Antes de CPI/FOMC: manos quietas. Iconos: rojo = alto · ámbar = medio. Solo se muestran eventos de alto impacto (cualquier divisa) o impacto medio en USD.</p>
     </section>
   );
 }
@@ -885,7 +979,9 @@ function Diagnosis({ btc, fg, etf, onchain, ai, cfg = ASSETS.BTCUSDT, zonesLoadi
         : "border-amber-500/40 bg-amber-500/10 text-amber-200"}`}>
         {verdict}
       </div>
-      {ai?.text ? (
+      {ai?.error ? (
+        <p className="mt-3 text-xs text-rose-300">{ai.error}</p>
+      ) : ai?.text ? (
         <div className="mt-3 text-xs text-slate-300 whitespace-pre-wrap leading-relaxed">{ai.text}</div>
       ) : zonesLoading || !hasZones ? (
         <p className="mt-3 text-xs text-slate-500">Esperando análisis de Gemini Pro con velas y contexto en vivo…</p>
@@ -940,7 +1036,7 @@ function Playbook({ data, aiModel, loading }) {
           </span>
         ) : null}
       </div>
-      <p className="text-[11px] text-slate-500 mb-3">Escenarios, no señales. Antes de ejecutar: filtro R:R + Bitácora.</p>
+      <p className="text-[11px] text-slate-500 mb-3">Escenarios, no señales. Antes de ejecutar: confirma R:R ≥ 1.5 y revisa la compuerta pre-trade.</p>
       <div className="grid gap-3 lg:grid-cols-3">
         {rows.map((h) => (
           <div key={h.horizon} className="rounded-lg border border-slate-700/60 bg-slate-950/40 p-3">
@@ -969,78 +1065,16 @@ function Playbook({ data, aiModel, loading }) {
   );
 }
 
-// ───────────────────────── filtro R:R + checklist (igual) ──────────────────
-// Fuera de RiskGate a propósito: definirlo adentro hacía que React lo tratara
-// como un componente nuevo en cada render y el input perdía el foco al tipear.
-function RiskField({ label, val, set, hint }) {
-  return (
-    <label className="block">
-      <span className="text-[11px] uppercase tracking-wider text-slate-400">{label}</span>
-      <input value={val} onChange={(e) => set(e.target.value)} inputMode="decimal" placeholder={hint}
-        className="mt-1 w-full rounded-md bg-slate-950 border border-slate-700 px-2.5 py-1.5 font-mono text-sm text-slate-100 focus:border-slate-400 focus:outline-none" />
-    </label>
-  );
-}
-
-function RiskGate() {
-  const [entry, setEntry] = useState(""), [stop, setStop] = useState(""), [target, setTarget] = useState("");
-  const [risk, setRisk] = useState("100"), [ppl, setPpl] = useState("1");
-  const r = useMemo(() => {
-    const e = +entry, s = +stop, t = +target, rk = +risk, p = +ppl;
-    if ([e, s, t].some((x) => !isFinite(x) || x === 0) && (entry === "" || stop === "" || target === "")) return null;
-    if (![e, s, t].every(isFinite)) return null;
-    const sd = Math.abs(e - s), rw = Math.abs(t - e);
-    const rr = sd === 0 ? 0 : rw / sd;
-    const lots = sd && p ? rk / (sd * p) : 0;
-    const round = e % 1000 === 0 || e % 500 === 0;
-    return { sd, rr, lots, round, pass: rr >= 1.5 && !round };
-  }, [entry, stop, target, risk, ppl]);
-  return (
-    <div className="rounded-lg border border-slate-700/60 bg-slate-900/50 p-4">
-      <div className="flex items-center gap-2 mb-3">
-        <Target size={16} className="text-slate-300" />
-        <h3 className="font-mono text-sm tracking-wide text-slate-200">Filtro R:R + Lotaje</h3>
-      </div>
-      <div className="grid grid-cols-2 gap-3">
-        <RiskField label="Entrada" val={entry} set={setEntry} hint="58500" />
-        <RiskField label="Stop" val={stop} set={setStop} hint="54800" />
-        <RiskField label="Target" val={target} set={setTarget} hint="80000" />
-        <RiskField label="Riesgo $" val={risk} set={setRisk} hint="100" />
-        <RiskField label="$/punto/lote" val={ppl} set={setPpl} hint="BTC≈1 · ETH verificar" />
-      </div>
-      {r && (
-        <div className="mt-4 space-y-2">
-          {r.round && (
-            <div className="flex items-start gap-2 rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2">
-              <AlertTriangle size={15} className="text-rose-400 mt-0.5 shrink-0" />
-              <span className="text-xs text-rose-200">Número redondo = trampa de liquidez. Mueve el POI cerca de la invalidación.</span>
-            </div>
-          )}
-          <div className="grid grid-cols-3 gap-2 font-mono text-sm">
-            <div className="rounded-md bg-slate-950 border border-slate-700 px-2 py-2"><div className="text-[10px] uppercase text-slate-500">Stop pts</div><div className="text-slate-100">{r.sd.toLocaleString()}</div></div>
-            <div className="rounded-md bg-slate-950 border border-slate-700 px-2 py-2"><div className="text-[10px] uppercase text-slate-500">R:R</div><div className={r.rr >= 1.5 ? "text-emerald-400" : "text-rose-400"}>1:{r.rr.toFixed(2)}</div></div>
-            <div className="rounded-md bg-slate-950 border border-slate-700 px-2 py-2"><div className="text-[10px] uppercase text-slate-500">Lotaje</div><div className="text-slate-100">{r.lots.toFixed(3)}</div></div>
-          </div>
-          <div className={`flex items-center gap-2 rounded-md px-3 py-2 text-sm font-semibold ${r.pass ? "bg-emerald-500/10 border border-emerald-500/40 text-emerald-300" : "bg-rose-500/10 border border-rose-500/40 text-rose-300"}`}>
-            {r.pass ? <CheckCircle2 size={16} /> : <XCircle size={16} />}
-            {r.pass ? "Cumple R:R ≥ 1.5 y no es número redondo." : "RECHAZADO. R:R < 1.5 o número redondo."}
-          </div>
-        </div>
-      )}
-      <p className="mt-3 text-[11px] text-slate-500">KPI objetivo: payoff ≥ 1.5. Tu real histórico: 0.41.</p>
-    </div>
-  );
-}
-
+// ───────────────────────── checklist pre-trade ──────────────────────────────
 const CHECKS = [
-  "Registrado en la Bitácora ANTES de ejecutar",
+  "Veredicto de hoy (Risk & Portfolio Manager) revisado ANTES de ejecutar",
   "El activo es BTC o ETH (nada más)",
   "R:R ≥ 1.5 confirmado",
   "Entrada en POI estructural, NO en número redondo",
   "Stop por DEBAJO del cluster retail obvio",
   "Sin evento macro de alto impacto pendiente (CPI/FOMC)",
 ];
-// Lista de referencia, sin interacción — el control real es la Bitácora pre-log.
+// Lista de referencia, sin interacción — el control real es el veredicto del Risk Manager.
 function Checklist() {
   return (
     <div className="rounded-lg border border-slate-700/60 bg-slate-900/50 p-4">
@@ -1066,6 +1100,7 @@ export default function Cockpit() {
   const derivs = useDerivs();
   const onchain = useOnchain();
   const daily = useBtcDaily();
+  const macro = useMacro();
   const btc = prices.BTCUSDT?.price ?? null;
   const eth = prices.ETHUSDT?.price ?? null;
   const sol = prices.SOLUSDT?.price ?? null;
@@ -1075,22 +1110,6 @@ export default function Cockpit() {
   const ready = status === "live" && btc != null;
   const { data: aiZones, loading: zonesLoading } = useAiZones(ready, ctxRef);
   const ai = useAiDiagnosis(ready, ctxRef, aiZones);
-  ctxRef.current = {
-    precios: { btc, eth, sol },
-    cambio24h: {
-      btc: prices.BTCUSDT?.change ?? null,
-      eth: prices.ETHUSDT?.change ?? null,
-      sol: prices.SOLUSDT?.change ?? null,
-    },
-    fearGreed: fg,
-    dominancia: dom,
-    etfFlujosUsdM: etf,
-    derivados: derivs,
-    onchain,
-    mayer200d: daily?.mayer ?? null,
-    rsi22d: daily?.rsi22 ?? null,
-    zonasIA: aiZones?.zones ?? null,
-  };
 
   // Config de cada activo: zonas IA si llegaron, estáticas si no.
   const mergedAssets = useMemo(() => {
@@ -1114,6 +1133,37 @@ export default function Cockpit() {
     }
     return out;
   }, [aiZones]);
+
+  // Estructura técnica multi-temporal de BTC (4H + semanal + mensual) —
+  // alimenta el veredicto del Risk Manager y el resumen completo de la IA.
+  const structure = useBtcStructure(mergedAssets.BTCUSDT);
+
+  ctxRef.current = {
+    precios: { btc, eth, sol },
+    cambio24h: {
+      btc: prices.BTCUSDT?.change ?? null,
+      eth: prices.ETHUSDT?.change ?? null,
+      sol: prices.SOLUSDT?.change ?? null,
+    },
+    fearGreed: fg,
+    dominancia: dom,
+    etfFlujosUsdM: etf,
+    derivados: derivs,
+    onchain,
+    mayer200d: daily?.mayer ?? null,
+    rsi22d: daily?.rsi22 ?? null,
+    zonasIA: aiZones?.zones ?? null,
+    macro: macro ? { dxy: macro.dxy ?? null, sp500: macro.sp500 ?? null } : null,
+    estructuraBTC: structure ? {
+      choch4h: structure.choch4h,
+      bos4h: structure.bos4h,
+      liquiditySweep: structure.liquiditySweep,
+      htfBullish: structure.htfBullish,
+      weeklyBullish: structure.weeklyBullish,
+      monthlyBullish: structure.monthlyBullish,
+      trend: structure.trend,
+    } : null,
+  };
 
   const Live = ({ label, value, sub, tone }) => (
     <div className={`rounded-md border px-2.5 py-2 ${tone || "border-slate-700 bg-slate-800/40 text-slate-200"}`}>
@@ -1170,24 +1220,6 @@ export default function Cockpit() {
 
         <EconomicCalendar />
 
-        <Diagnosis btc={btc} fg={fg} etf={etf} onchain={onchain} ai={ai} cfg={mergedAssets.BTCUSDT} zonesLoading={zonesLoading} />
-
-        <RiskPortfolioManager
-          btc={btc}
-          eth={eth}
-          btcChange={prices.BTCUSDT?.change ?? null}
-          ethChange={prices.ETHUSDT?.change ?? null}
-          fg={fg}
-          etf={etf}
-          derivs={derivs}
-          onchain={onchain}
-          daily={daily}
-          btcCfg={mergedAssets.BTCUSDT}
-          ethCfg={mergedAssets.ETHUSDT}
-        />
-
-        <Playbook data={aiZones?.playbook} aiModel={aiZones?.model} loading={zonesLoading} />
-
         {/* indicadores: live vs snapshot, separados y honestos */}
         <section className="rounded-xl border border-slate-700/60 bg-slate-900/60 p-4">
           <div className="flex items-center gap-2 mb-2"><Radio size={15} className="text-emerald-400" /><h2 className="text-sm font-mono tracking-wide text-slate-300">En vivo</h2></div>
@@ -1238,11 +1270,28 @@ export default function Cockpit() {
           </div>
         </section>
 
+        <RiskPortfolioManager
+          btc={btc}
+          eth={eth}
+          btcChange={prices.BTCUSDT?.change ?? null}
+          ethChange={prices.ETHUSDT?.change ?? null}
+          fg={fg}
+          etf={etf}
+          derivs={derivs}
+          onchain={onchain}
+          daily={daily}
+          macro={macro}
+          structure={structure}
+          btcCfg={mergedAssets.BTCUSDT}
+          ethCfg={mergedAssets.ETHUSDT}
+        />
+
+        <Diagnosis btc={btc} fg={fg} etf={etf} onchain={onchain} ai={ai} cfg={mergedAssets.BTCUSDT} zonesLoading={zonesLoading} />
+
+        <Playbook data={aiZones?.playbook} aiModel={aiZones?.model} loading={zonesLoading} />
+
         {/* disciplina */}
-        <section className="grid gap-4 lg:grid-cols-2">
-          <RiskGate />
-          <Checklist />
-        </section>
+        <Checklist />
 
         {/* fuentes */}
         <section className="rounded-xl border border-slate-700/60 bg-slate-900/60 p-4">

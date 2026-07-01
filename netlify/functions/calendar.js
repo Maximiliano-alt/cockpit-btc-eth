@@ -1,7 +1,18 @@
-// Calendario económico semanal (Forex Factory vía feed público).
+// Calendario económico semanal (Forex Factory vía feed público), filtrado a
+// lo relevante para cripto: el driver macro de BTC/ETH es la política
+// monetaria y liquidez en USD, no datos retail de otras divisas.
 // Cache 1 h — suficiente para eventos macro.
 let cache = { at: 0, body: null };
 const TTL = 60 * 60 * 1000;
+
+// Alto impacto en cualquier divisa mueve el sentimiento de riesgo global
+// (y por lo tanto cripto); medio impacto solo importa si es en USD, que es
+// la divisa que de verdad correlaciona con BTC/ETH (Fed, CPI, NFP, etc).
+function isCryptoRelevant(e) {
+  if (e.impact === "High") return true;
+  if (e.impact === "Medium" && e.country === "USD") return true;
+  return false;
+}
 
 exports.handler = async () => {
   if (cache.body && Date.now() - cache.at < TTL) {
@@ -21,6 +32,7 @@ exports.handler = async () => {
         previous: String(e.previous ?? "").slice(0, 30),
       }))
       .filter((e) => e.title && e.date)
+      .filter(isCryptoRelevant)
       .sort((a, b) => new Date(a.date) - new Date(b.date));
     const body = JSON.stringify({ events, at: Date.now() });
     cache = { at: Date.now(), body };

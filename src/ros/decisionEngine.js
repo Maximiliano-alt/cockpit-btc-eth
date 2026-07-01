@@ -1,36 +1,4 @@
-import { LIMITS, MARKET_PHASE, TRAFFIC_LIGHT, TRADING_MODE } from "./types.js";
-
-/** @param {import('./types.js').PortfolioState} portfolio */
-export function computeRiskMetrics(portfolio) {
-  const { accountBalance, maxRiskPerTradePct, maxPortfolioRiskPct, positions } = portfolio;
-  const maxRiskPerTrade = (accountBalance * maxRiskPerTradePct) / 100;
-  const maxPortfolioRisk = (accountBalance * maxPortfolioRiskPct) / 100;
-  const currentPortfolioRisk = positions.reduce((s, p) => s + (p.riskUsd || 0), 0);
-  const availableRisk = Math.max(0, maxPortfolioRisk - currentPortfolioRisk);
-  const riskUtilPct = maxPortfolioRisk > 0 ? (currentPortfolioRisk / maxPortfolioRisk) * 100 : 0;
-  return {
-    accountBalance,
-    maxRiskPerTradePct,
-    maxPortfolioRiskPct,
-    maxRiskPerTrade,
-    maxPortfolioRisk,
-    currentPortfolioRisk,
-    availableRisk,
-    riskUtilPct,
-  };
-}
-
-export function computeExposure(portfolio) {
-  const { accountBalance, exposedCapital } = portfolio;
-  const pct = accountBalance > 0 ? (exposedCapital / accountBalance) * 100 : 0;
-  let status = "SEGURO";
-  let tone = "good";
-  let blockNewEntries = false;
-  if (pct > 80) { status = "BLOQUEADO"; tone = "danger"; blockNewEntries = true; }
-  else if (pct > 60) { status = "ELEVADO"; tone = "danger"; }
-  else if (pct > 30) { status = "MODERADO"; tone = "warn"; }
-  return { exposedCapital, pct, status, tone, blockNewEntries };
-}
+import { MARKET_PHASE, TRADING_MODE } from "./types.js";
 
 /** @param {object} ctx */
 export function classifyMarketPhase(ctx) {
@@ -103,119 +71,42 @@ function pricesChange(ctx) {
   return ctx.btcChange != null && ctx.ethChange != null;
 }
 
-/** Regla no negociable: sin asimetría HTF + liquidez + macro => NO_TRADE */
-export function runDecisionEngine(ctx) {
-  const {
-    structure, marketPhase, riskMetrics, exposure, portfolio,
-    macroBullish, hasClearAsymmetry,
-  } = ctx;
-
-  const hasOpen = portfolio.positions.length > 0;
-  const riskOk = riskMetrics.availableRisk > 0 && !exposure.blockNewEntries;
+/**
+ * Veredicto del día a partir de TODAS las temporalidades (4H + semanal +
+ * mensual) más el contexto macro — sin depender de portafolio/riesgo manual.
+ */
+export function computeDailyVerdict({ structure, marketPhase, macroBullish }) {
   const choch = structure?.choch4h === true;
+  const bos = structure?.bos4h === true;
   const sweep = structure?.liquiditySweep === true;
   const weekly = structure?.weeklyBullish === true;
   const monthly = structure?.monthlyBullish === true;
   const macro = macroBullish === true;
 
-  let mode = TRADING_MODE.NO_TRADE;
-  let rationale = "Sin asimetría clara HTF + liquidez + macro. Inacción preferida.";
+  const timeframes = { h4: choch || bos, weekly, monthly, macro };
+  const alignedCount = Object.values(timeframes).filter(Boolean).length;
 
-  if (hasOpen) {
-    mode = TRADING_MODE.MANAGE;
-    rationale = "Hay posición(es) abierta(s). Hoy es día de gestión, no de nuevas entradas.";
-  } else if (!hasClearAsymmetry || !riskOk) {
-    mode = TRADING_MODE.NO_TRADE;
-    rationale = exposure.blockNewEntries
-      ? "Exposición >80% — bloqueadas nuevas entradas."
-      : "Riesgo disponible agotado o sin asimetría — no operar.";
-  } else if (macro && weekly && monthly) {
-    mode = TRADING_MODE.POSITION;
-    rationale = "Macro + semanal + mensual alineados — ventana de posición (con filtro R:R).";
-  } else if (choch && sweep && riskMetrics.availableRisk > 0) {
-    mode = TRADING_MODE.SWING;
-    rationale = "CHoCH + barrido de liquidez + riesgo disponible — swing condicionado.";
-  } else if (!choch && marketPhase.phase === MARKET_PHASE.MANIPULATION) {
-    mode = TRADING_MODE.NO_TRADE;
-    rationale = "Fase manipulación sin CHoCH — esperar confirmación estructural.";
+  if (!structure) {
+    return { mode: TRADING_MODE.NO_TRADE, rationale: "Sin datos de estructura todavía.", timeframes };
   }
-
-  return { mode, rationale };
-}
-
-export function computeTrafficLight(tradingMode, blockers) {
-  if (blockers.length > 0 || tradingMode === TRADING_MODE.NO_TRADE) {
-    return { light: TRAFFIC_LIGHT.WAIT, label: "NO HACER NADA", emoji: "🔴" };
+  if (marketPhase?.phase === MARKET_PHASE.MANIPULATION && !choch) {
+    return { mode: TRADING_MODE.NO_TRADE, rationale: "Fase de manipulación sin CHoCH confirmado — esperar.", timeframes };
   }
-  if (tradingMode === TRADING_MODE.MANAGE) {
-    return { light: TRAFFIC_LIGHT.MANAGE, label: "GESTIONAR", emoji: "🟡" };
+  if (macro && weekly && monthly && (choch || bos)) {
+    return { mode: TRADING_MODE.POSITION, rationale: "4H, semanal, mensual y macro alineados — ventana de posición (filtro R:R obligatorio).", timeframes };
   }
-  return { light: TRAFFIC_LIGHT.ACT, label: "ACTUAR", emoji: "🟢" };
-}
-
-export function computeAntiFomo(ctx) {
-  const { btc, eth, btcCfg, ethCfg, fg, structure } = ctx;
-  const blocks = [];
-
-  if (btcCfg?.poi?.hi && btc != null && btc > btcCfg.poi.hi && !structure?.choch4h) {
-    blocks.push({ id: "chase", text: "PROHIBIDO PERSEGUIR PRECIO", detail: "BTC por encima del POI sin CHoCH." });
+  if (choch && sweep) {
+    return { mode: TRADING_MODE.SWING, rationale: "CHoCH + barrido de liquidez en 4H — swing condicionado, falta confirmación HTF completa.", timeframes };
   }
-  if (ethCfg?.poi && eth != null) {
-    const mid = (ethCfg.poi.lo + ethCfg.poi.hi) / 2;
-    if (mid > 0 && (eth - mid) / mid > 0.08) {
-      blocks.push({ id: "fomo", text: "FOMO DETECTADO", detail: "ETH >8% por encima del POI." });
-    }
+  if (alignedCount >= 3) {
+    return { mode: TRADING_MODE.SWING, rationale: "Mayoría de temporalidades alineadas, pero sin gatillo de entrada (CHoCH + barrido) en 4H todavía.", timeframes };
   }
-  if (fg?.value != null && fg.value < 20) {
-    blocks.push({ id: "fear", text: "MIEDO EXTREMO NO SIGNIFICA COMPRAR", detail: `Fear & Greed ${fg.value}.` });
-  }
-  if (exposureBlock(ctx.exposure)) {
-    blocks.push({ id: "exposure", text: "EXPOSICIÓN MÁXIMA", detail: "No abrir nuevas posiciones." });
-  }
-
-  return blocks;
-}
-
-function exposureBlock(exposure) {
-  return exposure?.blockNewEntries === true;
-}
-
-export function computeAllowedTrades(portfolio, tradingMode, exposure) {
-  const swings = portfolio.positions.filter((p) => p.type === "swing").length;
-  const positions = portfolio.positions.filter((p) => p.type === "position").length;
-  const total = portfolio.positions.length;
-
-  const swingSlots = Math.max(0, LIMITS.maxSwingTrades - swings);
-  const positionSlots = Math.max(0, LIMITS.maxPositionTrades - positions);
-  const simSlots = Math.max(0, LIMITS.maxSimultaneous - total);
-
-  let newEntries = Math.min(swingSlots, positionSlots, simSlots);
-  if (exposure.blockNewEntries || tradingMode === TRADING_MODE.NO_TRADE) newEntries = 0;
-  if (tradingMode === TRADING_MODE.MANAGE) newEntries = 0;
-
-  return {
-    maxPositionTrades: LIMITS.maxPositionTrades,
-    maxSwingTrades: LIMITS.maxSwingTrades,
-    maxSimultaneous: LIMITS.maxSimultaneous,
-    maxRiskPct: portfolio.maxPortfolioRiskPct,
-    currentSwings: swings,
-    currentPositions: positions,
-    newEntriesAvailable: newEntries,
-  };
-}
-
-export function deriveBias(marketPhase, structure) {
-  if (marketPhase.phase === MARKET_PHASE.ACCUMULATION) return "Neutral alcista (acumulación)";
-  if (marketPhase.phase === MARKET_PHASE.EXPANSION) return "Alcista";
-  if (marketPhase.phase === MARKET_PHASE.DISTRIBUTION) return "Neutral bajista / distribución";
-  if (structure?.trend === "bearish") return "Neutral bajista";
-  return "Neutral — esperar estructura";
+  return { mode: TRADING_MODE.NO_TRADE, rationale: "Sin asimetría clara entre temporalidades — inacción preferida.", timeframes };
 }
 
 export function modeLabel(mode) {
   const map = {
     [TRADING_MODE.NO_TRADE]: "NO_TRADE",
-    [TRADING_MODE.MANAGE]: "MANAGE",
     [TRADING_MODE.SWING]: "SWING",
     [TRADING_MODE.POSITION]: "POSITION",
   };
@@ -225,19 +116,8 @@ export function modeLabel(mode) {
 export function modeDescription(mode) {
   const map = {
     [TRADING_MODE.NO_TRADE]: "Hoy no operar. Preservar capital.",
-    [TRADING_MODE.MANAGE]: "Hoy es día de gestión. No abrir nuevas posiciones.",
-    [TRADING_MODE.SWING]: "Ventana swing condicionada — pasar por filtro R:R.",
-    [TRADING_MODE.POSITION]: "Ventana de posición macro — tamaño conservador.",
+    [TRADING_MODE.SWING]: "Ventana swing condicionada — confirmar estructura antes de ejecutar.",
+    [TRADING_MODE.POSITION]: "Ventana de posición: todas las temporalidades alineadas. Tamaño conservador.",
   };
   return map[mode] || "";
-}
-
-export function riskTone(riskUtilPct) {
-  if (riskUtilPct > 80) return "danger";
-  if (riskUtilPct >= 50) return "warn";
-  return "good";
-}
-
-export function exposureTone(tone) {
-  return tone;
 }
