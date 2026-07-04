@@ -74,7 +74,9 @@ exports.handler = async (event) => {
     let text, model;
     if (gemini) {
       try {
-        const r = await callGeminiWithFallback(gemini, SYSTEM, user, { maxOutputTokens: 2048, temperature: 0.35 });
+        const r = await callGeminiWithFallback(gemini, SYSTEM, user, {
+          maxOutputTokens: 2048, temperature: 0.35, timeoutMs: 20000, overallBudgetMs: 27000,
+        });
         text = r.text; model = r.model;
       } catch (e) {
         if (!anthropic) throw e;

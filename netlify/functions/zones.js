@@ -124,8 +124,12 @@ exports.handler = async (event) => {
     let text, model;
     if (gemini) {
       try {
+        // Sin responseMimeType: el SYSTEM ya exige "SOLO JSON" y el parseo
+        // de abajo extrae el bloque {...} igual. Forzar JSON mode se
+        // observó colgando algunos alias de modelo (timeout sin respuesta).
         const r = await callGeminiWithFallback(gemini, SYSTEM, user, {
-          maxOutputTokens: 8192, temperature: 0.25, responseMimeType: "application/json",
+          maxOutputTokens: 4096, temperature: 0.25,
+          timeoutMs: 24000, overallBudgetMs: 27000,
         });
         text = r.text; model = r.model;
       } catch (e) {
