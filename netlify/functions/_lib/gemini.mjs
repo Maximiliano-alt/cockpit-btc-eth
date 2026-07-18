@@ -1,26 +1,36 @@
-// Helper compartido para llamar a Gemini con fallback automático de modelo.
-// Los modelos "pro"/preview suelen tener cuota gratuita 0 o muy baja. En vez
-// de probar primero el modelo configurado (que puede estar sin cuota y hacer
-// perder varios segundos antes de fallar — arriesgando el timeout de 30s de
-// la function), probamos primero los "flash" (rápidos, cuota gratuita
-// generosa) y dejamos el configurado como último recurso.
-// Además: cada intento tiene un timeout corto propio y recordamos, dentro del
-// mismo contenedor tibio, cuál fue el último modelo que funcionó, para ir
-// directo a él en la siguiente invocación en vez de repetir todo el ciclo.
-const FLASH_FALLBACKS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest"];
-const PER_MODEL_TIMEOUT_MS = 9000;
+// Helper compartido para llamar a Gemini rotando entre los pools gratuitos.
+// En el free tier CADA modelo tiene su propia cuota diaria (~20 req/día) y
+// por minuto (~5 RPM), así que rotar entre varios multiplica la cuota total
+// disponible. Orden: mejor calidad primero, los "lite" como red de seguridad.
+// El modelo configurado en GEMINI_MODEL se intenta al final (es el que más
+// probablemente esté mal configurado o sin cuota, p. ej. un "pro" preview).
+const FREE_MODELS = [
+  "gemini-flash-latest",      // alias del flash más nuevo (hoy: 3.5 Flash)
+  "gemini-2.5-flash",
+  "gemini-2.5-flash-lite",    // pool aparte, casi siempre con cuota libre
+  "gemini-flash-lite-latest",
+  "gemini-2.0-flash",
+];
+const PER_MODEL_TIMEOUT_MS = 20000;
 
 let lastGoodModel = null;
 
 function candidateModels() {
   const configured = process.env.GEMINI_MODEL;
-  const rest = FLASH_FALLBACKS.filter((m) => m !== configured);
+  const rest = FREE_MODELS.filter((m) => m !== configured && m !== lastGoodModel);
   const ordered = [
     ...(lastGoodModel ? [lastGoodModel] : []),
     ...rest,
-    ...(configured ? [configured] : []),
+    ...(configured && configured !== lastGoodModel ? [configured] : []),
   ];
   return [...new Set(ordered)];
+}
+
+// Los flash 2.5/3.5 traen "thinking" activado por defecto: los pensamientos
+// consumen maxOutputTokens (truncando el JSON) y suman segundos de latencia.
+// Para este dashboard queremos respuesta rápida y completa → thinking off.
+function supportsThinkingConfig(model) {
+  return /2\.5|3\.5|-latest/.test(model);
 }
 
 async function callGeminiModel(model, key, system, user, opts) {
@@ -39,7 +49,8 @@ async function callGeminiModel(model, key, system, user, opts) {
           generationConfig: {
             maxOutputTokens: opts.maxOutputTokens ?? 2048,
             temperature: opts.temperature ?? 0.3,
-            ...(opts.responseMimeType ? { responseMimeType: opts.responseMimeType } : {}),
+            ...(opts.responseJson ? { responseMimeType: "application/json" } : {}),
+            ...(supportsThinkingConfig(model) ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
           },
         }),
       }
@@ -63,13 +74,11 @@ async function callGeminiModel(model, key, system, user, opts) {
   }
 }
 
-// Prueba el último modelo que funcionó, luego los flash, y el configurado al
-// final — hasta obtener una respuesta o agotar la lista. Respeta un
-// presupuesto total de tiempo para nunca chocar con el timeout duro de la
-// function (30s) — mejor devolver un error JSON prolijo que un timeout mudo.
-async function callGeminiWithFallback(key, system, user, opts = {}) {
+// Recorre los pools hasta obtener respuesta, respetando un presupuesto total
+// para nunca chocar con el timeout duro de la function (30s).
+export async function callGeminiWithFallback(key, system, user, opts = {}) {
   const models = candidateModels();
-  const overallBudgetMs = opts.overallBudgetMs ?? 25000;
+  const overallBudgetMs = opts.overallBudgetMs ?? 26000;
   const start = Date.now();
   let lastErr;
   for (const model of models) {
@@ -86,11 +95,10 @@ async function callGeminiWithFallback(key, system, user, opts = {}) {
       console.log(`[gemini] ${model} FALLÓ en ${Date.now() - attemptStart}ms: ${String(e).slice(0, 200)}`);
       lastErr = e;
       if (lastGoodModel === model) lastGoodModel = null;
-      // 401/403: la key no sirve, cambiar de modelo no lo arregla.
+      // 400/401/403: la key no sirve o el modelo no existe para esta key —
+      // cambiar de modelo sí puede ayudar en 400/404, pero en 401/403 no.
       if (e.status === 401 || e.status === 403) throw e;
     }
   }
   throw lastErr || new Error("Sin modelos Gemini disponibles (tiempo agotado)");
 }
-
-module.exports = { callGeminiWithFallback };

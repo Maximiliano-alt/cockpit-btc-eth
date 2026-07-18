@@ -1,10 +1,11 @@
 // Diagnóstico generado por LLM con el contexto completo del dashboard.
-// Gemini (con fallback automático de modelo); Anthropic solo si Gemini falla del todo.
-// Cache 15 min por clave de contexto (precio redondeado + zonas + hora).
-const { callGeminiWithFallback } = require("./_lib/gemini.js");
+// Resultado cacheado en Netlify Blobs (persistente): la página siempre carga
+// el último diagnóstico al instante; solo se regenera cada 45 min — clave
+// para vivir dentro de la cuota gratuita de Gemini (~20 req/día por modelo).
+import { callGeminiWithFallback } from "./_lib/gemini.mjs";
+import { withAiCache } from "./_lib/aicache.mjs";
 
-let cache = { at: 0, key: null, body: null };
-const TTL = 15 * 60 * 1000;
+const TTL = 45 * 60 * 1000;
 
 const SYSTEM =
   "Eres un analista institucional de trading (SMC/Wyckoff + on-chain + macro) escribiendo el diagnóstico " +
@@ -26,20 +27,6 @@ const SYSTEM =
   "uses. Sé exhaustivo pero conciso: máximo ~220 palabras en total. " +
   "Nunca recomiendes entrar a mercado sin estructura confirmada; nunca sugieras operar otros activos.";
 
-function cacheKey(body) {
-  try {
-    const j = JSON.parse(body || "{}");
-    const btc = Math.round((j.precios?.btc || 0) / 250) * 250;
-    const eth = Math.round((j.precios?.eth || 0) / 25) * 25;
-    const hour = new Date().toISOString().slice(0, 13);
-    const zones = JSON.stringify(j.zonasIA || null);
-    const estructura = JSON.stringify(j.estructuraBTC || null);
-    return `${hour}|${btc}|${eth}|${zones.slice(0, 400)}|${estructura.slice(0, 200)}`;
-  } catch {
-    return String(Date.now());
-  }
-}
-
 async function callAnthropic(key, user) {
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -56,41 +43,47 @@ async function callAnthropic(key, user) {
   return (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("").trim();
 }
 
-exports.handler = async (event) => {
-  if (event.httpMethod !== "POST") {
-    return { statusCode: 405, body: "Method Not Allowed" };
-  }
-  const key = cacheKey(event.body);
-  if (cache.body && cache.key === key && Date.now() - cache.at < TTL) {
-    return { statusCode: 200, body: cache.body };
-  }
+const jsonResponse = (obj, status = 200) =>
+  new Response(JSON.stringify(obj), { status, headers: { "content-type": "application/json" } });
+
+export default async (req) => {
+  if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
   const gemini = process.env.GEMINI_API_KEY;
   const anthropic = process.env.ANTHROPIC_API_KEY;
   if (!gemini && !anthropic) {
-    return { statusCode: 500, body: JSON.stringify({ error: "Sin GEMINI_API_KEY ni ANTHROPIC_API_KEY" }) };
+    return jsonResponse({ error: "Sin GEMINI_API_KEY ni ANTHROPIC_API_KEY" }, 500);
   }
-  const user = "Contexto en vivo (todas las variables del cockpit):\n" + (event.body || "{}");
+  const bodyText = await req.text();
+  const force = new URL(req.url).searchParams.get("force") === "1";
   try {
-    let text, model;
-    if (gemini) {
-      try {
-        const r = await callGeminiWithFallback(gemini, SYSTEM, user, {
-          maxOutputTokens: 2048, temperature: 0.35, timeoutMs: 20000, overallBudgetMs: 27000,
-        });
-        text = r.text; model = r.model;
-      } catch (e) {
-        if (!anthropic) throw e;
-        text = await callAnthropic(anthropic, user);
-        model = "claude-sonnet-4-6";
-      }
-    } else {
-      text = await callAnthropic(anthropic, user);
-      model = "claude-sonnet-4-6";
-    }
-    const body = JSON.stringify({ text, model, at: Date.now() });
-    if (text) cache = { at: Date.now(), key, body };
-    return { statusCode: 200, body };
+    const { data, served } = await withAiCache({
+      key: "diagnosis",
+      ttlMs: TTL,
+      force,
+      generate: async () => {
+        const user = "Contexto en vivo (todas las variables del cockpit):\n" + (bodyText || "{}");
+        let text, model;
+        if (gemini) {
+          try {
+            const r = await callGeminiWithFallback(gemini, SYSTEM, user, {
+              maxOutputTokens: 2048, temperature: 0.35, timeoutMs: 20000, overallBudgetMs: 26000,
+            });
+            text = r.text; model = r.model;
+          } catch (e) {
+            if (!anthropic) throw e;
+            text = await callAnthropic(anthropic, user);
+            model = "claude-sonnet-4-6";
+          }
+        } else {
+          text = await callAnthropic(anthropic, user);
+          model = "claude-sonnet-4-6";
+        }
+        if (!text) throw new Error("respuesta vacía del modelo");
+        return { text, model, at: Date.now() };
+      },
+    });
+    return jsonResponse({ ...data, served });
   } catch (e) {
-    return { statusCode: 500, body: JSON.stringify({ error: String(e) }) };
+    return jsonResponse({ error: String(e) }, 500);
   }
 };

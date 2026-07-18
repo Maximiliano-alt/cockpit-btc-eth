@@ -344,15 +344,14 @@ function useBtcDaily() {
   return s;
 }
 
-// Diagnóstico IA — solo cuando las zonas dinámicas ya están listas.
-function useAiDiagnosis(online, ctxRef, aiZones) {
+// Diagnóstico IA — el servidor cachea en Netlify Blobs, así que la primera
+// respuesta llega al instante (último análisis) sin esperar a las zonas.
+function useAiDiagnosis(online, ctxRef) {
   const [ai, setAi] = useState(null);
   const [aiError, setAiError] = useState(null);
-  const zonesReady = !!(aiZones?.zones?.BTCUSDT && aiZones?.zones?.ETHUSDT);
   useEffect(() => {
-    if (!online || !zonesReady) return;
+    if (!online) return;
     let live = true;
-    let retries = 0;
     const load = async () => {
       try {
         const res = await fetch("/.netlify/functions/diagnosis", {
@@ -364,21 +363,19 @@ function useAiDiagnosis(online, ctxRef, aiZones) {
           const err = await res.json().catch(() => ({}));
           if (res.status === 500 && err.error?.includes("API_KEY")) {
             if (live) setAiError("Sin API keys configuradas. Revisa .env (GEMINI_API_KEY o ANTHROPIC_API_KEY).");
-            return;
           }
-          if (retries < 2) { retries++; } else { return; }
           return;
         }
         const j = await res.json();
-        if (live && j?.text) { setAi(j); setAiError(null); retries = 0; }
-      } catch (e) {
-        if (retries < 2) { retries++; } else if (live) setAiError("Error al cargar diagnóstico: " + String(e).slice(0, 50));
-      }
+        if (live && j?.text) { setAi(j); setAiError(null); }
+      } catch { /* siguiente intento del intervalo */ }
     };
-    load();
-    const t = setInterval(load, 15 * 60 * 1000);
-    return () => { live = false; clearInterval(t); };
-  }, [online, zonesReady, aiZones?.at, ctxRef]);
+    // Pequeña espera para que el contexto (precios, F&G) se llene antes del
+    // primer POST; el servidor responde desde cache igual, así que es rápido.
+    const first = setTimeout(load, 1200);
+    const t = setInterval(load, 10 * 60 * 1000);
+    return () => { live = false; clearTimeout(first); clearInterval(t); };
+  }, [online, ctxRef]);
   return ai || (aiError ? { error: aiError } : null);
 }
 
@@ -413,7 +410,7 @@ function useAiZones(online, ctxRef) {
       } catch { /* sin zonas */ }
       finally { if (live) setLoading(false); }
     };
-    const first = setTimeout(load, 2000);
+    const first = setTimeout(load, 400);
     const t = setInterval(load, 4 * 60 * 60 * 1000);
     return () => { live = false; clearTimeout(first); clearInterval(t); };
   }, [online, ctxRef]);
@@ -984,7 +981,7 @@ function Diagnosis({ btc, fg, etf, onchain, ai, cfg = ASSETS.BTCUSDT, zonesLoadi
       ) : ai?.text ? (
         <div className="mt-3 text-xs text-slate-300 whitespace-pre-wrap leading-relaxed">{ai.text}</div>
       ) : zonesLoading || !hasZones ? (
-        <p className="mt-3 text-xs text-slate-500">Esperando análisis de Gemini Pro con velas y contexto en vivo…</p>
+        <p className="mt-3 text-xs text-slate-500">Cargando el último análisis IA…</p>
       ) : (
         <ul className="mt-3 space-y-1.5">
           {bullets.map((b, i) => (
@@ -1018,7 +1015,7 @@ function Playbook({ data, aiModel, loading }) {
           <Target size={16} className="text-slate-300" />
           <h2 className="text-sm font-mono tracking-wide text-slate-300">Posibles posiciones — semanal · mensual · anual</h2>
         </div>
-        <p className="text-xs text-slate-500">Sin playbook IA disponible. Revisa la key de Gemini en Netlify.</p>
+        <p className="text-xs text-slate-500">Sin playbook IA todavía — se genera automáticamente en cuanto haya cuota del modelo gratuito.</p>
       </section>
     );
   }
@@ -1109,7 +1106,7 @@ export default function Cockpit() {
   const ctxRef = useRef(null);
   const ready = status === "live" && btc != null;
   const { data: aiZones, loading: zonesLoading } = useAiZones(ready, ctxRef);
-  const ai = useAiDiagnosis(ready, ctxRef, aiZones);
+  const ai = useAiDiagnosis(ready, ctxRef);
 
   // Config de cada activo: zonas IA si llegaron, estáticas si no.
   const mergedAssets = useMemo(() => {

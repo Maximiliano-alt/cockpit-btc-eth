@@ -1,11 +1,12 @@
 // Análisis de zonas dinámico por LLM. El cliente manda las últimas velas
 // diarias de cada activo + contexto; el modelo devuelve zonas (imán de
 // liquidez, POI) y línea de invalidación derivadas de la estructura real.
-// Gemini (con fallback automático de modelo si el configurado no tiene cuota);
-// cache 4 h por día + precios redondeados.
-const { callGeminiWithFallback } = require("./_lib/gemini.js");
+// Resultado cacheado en Netlify Blobs (persistente): la página siempre carga
+// el último análisis al instante y solo se regenera cada 4 h — clave para
+// vivir dentro de la cuota gratuita de Gemini (~20 req/día por modelo).
+import { callGeminiWithFallback } from "./_lib/gemini.mjs";
+import { withAiCache } from "./_lib/aicache.mjs";
 
-let cache = { at: 0, key: null, body: null };
 const TTL = 4 * 60 * 60 * 1000;
 
 const SYSTEM =
@@ -27,19 +28,6 @@ const SYSTEM =
   "Si la estructura no da para un long razonable en algún horizonte, di 'Esperar' y explica qué tendría que pasar.";
 
 function num(v) { return typeof v === "number" && isFinite(v) ? v : null; }
-
-function cacheKey(body) {
-  try {
-    const j = JSON.parse(body || "{}");
-    const day = new Date().toISOString().slice(0, 10);
-    const prices = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-      .map((s) => Math.round((j.assets?.[s]?.price || 0) / 100) * 100)
-      .join("|");
-    return `${day}|${prices}`;
-  } catch {
-    return String(Date.now());
-  }
-}
 
 function sanitize(raw) {
   const out = {};
@@ -105,51 +93,56 @@ async function callAnthropic(key, user) {
   return (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("").trim();
 }
 
-exports.handler = async (event) => {
-  if (event.httpMethod !== "POST") {
-    return { statusCode: 405, body: "Method Not Allowed" };
-  }
-  const ck = cacheKey(event.body);
-  if (cache.body && cache.key === ck && Date.now() - cache.at < TTL) {
-    return { statusCode: 200, body: cache.body };
-  }
+const jsonResponse = (obj, status = 200) =>
+  new Response(JSON.stringify(obj), { status, headers: { "content-type": "application/json" } });
+
+export default async (req) => {
+  if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
   const gemini = process.env.GEMINI_API_KEY;
   const anthropic = process.env.ANTHROPIC_API_KEY;
   if (!gemini && !anthropic) {
-    return { statusCode: 500, body: JSON.stringify({ error: "Sin GEMINI_API_KEY ni ANTHROPIC_API_KEY" }) };
+    return jsonResponse({ error: "Sin GEMINI_API_KEY ni ANTHROPIC_API_KEY" }, 500);
   }
+  const bodyText = await req.text();
+  const force = new URL(req.url).searchParams.get("force") === "1";
   try {
-    const ctx = JSON.parse(event.body || "{}");
-    const user = "Datos por activo y contexto:\n" + JSON.stringify(ctx);
-    let text, model;
-    if (gemini) {
-      try {
-        // Sin responseMimeType: el SYSTEM ya exige "SOLO JSON" y el parseo
-        // de abajo extrae el bloque {...} igual. Forzar JSON mode se
-        // observó colgando algunos alias de modelo (timeout sin respuesta).
-        const r = await callGeminiWithFallback(gemini, SYSTEM, user, {
-          maxOutputTokens: 4096, temperature: 0.25,
-          timeoutMs: 24000, overallBudgetMs: 27000,
-        });
-        text = r.text; model = r.model;
-      } catch (e) {
-        if (!anthropic) throw e;
-        text = await callAnthropic(anthropic, user);
-        model = "claude-sonnet-4-6";
-      }
-    } else {
-      text = await callAnthropic(anthropic, user);
-      model = "claude-sonnet-4-6";
-    }
-    const m = text.match(/\{[\s\S]*\}/);
-    const parsed = JSON.parse(m ? m[0] : text);
-    const zones = sanitize(parsed);
-    const playbook = sanitizePlaybook(parsed.playbook);
-    if (!Object.keys(zones).length) throw new Error("respuesta sin zonas válidas");
-    const body = JSON.stringify({ zones, playbook, model, at: Date.now() });
-    cache = { at: Date.now(), key: ck, body };
-    return { statusCode: 200, body };
+    const { data, served } = await withAiCache({
+      key: "zones",
+      ttlMs: TTL,
+      force,
+      generate: async () => {
+        const ctx = JSON.parse(bodyText || "{}");
+        if (!ctx.assets || !Object.keys(ctx.assets).length) {
+          throw new Error("sin velas en el request para generar zonas nuevas");
+        }
+        const user = "Datos por activo y contexto:\n" + JSON.stringify(ctx);
+        let text, model;
+        if (gemini) {
+          try {
+            const r = await callGeminiWithFallback(gemini, SYSTEM, user, {
+              maxOutputTokens: 8192, temperature: 0.25, responseJson: true,
+              timeoutMs: 24000, overallBudgetMs: 26000,
+            });
+            text = r.text; model = r.model;
+          } catch (e) {
+            if (!anthropic) throw e;
+            text = await callAnthropic(anthropic, user);
+            model = "claude-sonnet-4-6";
+          }
+        } else {
+          text = await callAnthropic(anthropic, user);
+          model = "claude-sonnet-4-6";
+        }
+        const m = text.match(/\{[\s\S]*\}/);
+        const parsed = JSON.parse(m ? m[0] : text);
+        const zones = sanitize(parsed);
+        const playbook = sanitizePlaybook(parsed.playbook);
+        if (!Object.keys(zones).length) throw new Error("respuesta sin zonas válidas");
+        return { zones, playbook, model, at: Date.now() };
+      },
+    });
+    return jsonResponse({ ...data, served });
   } catch (e) {
-    return { statusCode: 500, body: JSON.stringify({ error: String(e) }) };
+    return jsonResponse({ error: String(e) }, 500);
   }
 };
