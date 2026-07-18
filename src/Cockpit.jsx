@@ -819,17 +819,167 @@ function useEconomicCalendar() {
   return { events, err };
 }
 
+// Base de conocimiento local por tipo de evento: qué mide y cómo leerlo para
+// crypto. Sin llamadas a IA (instantáneo y no gasta cuota).
+const EVENT_KB = [
+  [/core cpi/i, {
+    que: "Inflación al consumidor SIN alimentos ni energía — la medida que la Fed mira de verdad para decidir tasas.",
+    crypto: "Dato por ENCIMA del pronóstico → inflación pegajosa → Fed dura → USD fuerte → presión bajista para BTC/ETH. Por DEBAJO → alivio → suele favorecer al riesgo.",
+  }],
+  [/\bcpi\b/i, {
+    que: "Índice de Precios al Consumidor: la inflación general del período. El dato macro que más mueve al mercado junto con el empleo.",
+    crypto: "Más alto que el pronóstico = hawkish (malo para crypto en el corto plazo). Más bajo = dovish (favorece al riesgo). La reacción del primer minuto suele ser violenta y con barridos.",
+  }],
+  [/core ppi|\bppi\b/i, {
+    que: "Inflación mayorista (precios de productores). Anticipa la inflación al consumidor de los próximos meses.",
+    crypto: "Mismo sesgo que el CPI pero con menos peso: sorpresa al alza presiona al riesgo, a la baja lo alivia.",
+  }],
+  [/non-farm|nfp/i, {
+    que: "Nóminas no agrícolas (NFP): cuántos empleos creó EE.UU. en el mes. El dato de empleo más importante del mundo.",
+    crypto: "Empleo muy fuerte → Fed sin apuro para recortar → USD fuerte → presión para BTC. Empleo débil → recortes más cerca → suele favorecer al riesgo (salvo pánico por recesión).",
+  }],
+  [/adp/i, {
+    que: "Empleo privado según ADP — se publica días antes del NFP y funciona como anticipo (imperfecto) de ese dato.",
+    crypto: "Mueve menos que el NFP, pero una sorpresa grande ajusta las expectativas para el viernes de nóminas.",
+  }],
+  [/unemployment rate/i, {
+    que: "Tasa de desempleo de EE.UU. Se publica junto con el NFP.",
+    crypto: "Subidas sostenidas alimentan la narrativa de recesión/recortes; el mercado la lee junto al NFP, no aislada.",
+  }],
+  [/unemployment claims/i, {
+    que: "Solicitudes semanales de subsidio por desempleo — el pulso más frecuente del mercado laboral americano.",
+    crypto: "Solo mueve si sorprende fuerte: claims muy altos = enfriamiento → recortes más cerca; muy bajos = economía caliente.",
+  }],
+  [/retail sales/i, {
+    que: "Ventas minoristas: cuánto consumió el hogar americano en el mes. Termómetro directo de la economía real.",
+    crypto: "Consumo fuerte = economía resistente (Fed puede esperar); débil = enfriamiento. Impacto moderado salvo sorpresa grande.",
+  }],
+  [/fomc|federal funds rate/i, {
+    que: "Decisión/minutas del comité de la Fed que fija la tasa de interés de EE.UU. El evento macro número uno.",
+    crypto: "Manos quietas alrededor del anuncio: la primera reacción suele revertirse. Lo que importa es el tono (dot plot, conferencia), no solo la tasa.",
+  }],
+  [/fed chair|powell|warsh/i, {
+    que: "Discurso/testimonio del presidente de la Fed. Cada matiz sobre tasas o inflación se opera en segundos.",
+    crypto: "Tono hawkish (preocupación por inflación) presiona a BTC; tono dovish (recortes a la vista) lo impulsa. Volatilidad intradía garantizada mientras habla.",
+  }],
+  [/speaks|testifies|testimony/i, {
+    que: "Discurso de un miembro de banco central. Puede adelantar el sesgo del próximo comité.",
+    crypto: "Impacto normalmente breve, salvo que anuncie un giro de política. Si coincide con tu entrada, espera a que termine.",
+  }],
+  [/rate statement|overnight rate|cash rate|monetary policy|press conference|bank rate/i, {
+    que: "Decisión de política monetaria de un banco central (tasas y comunicado).",
+    crypto: "Si no es la Fed, el efecto sobre crypto llega vía dólar: banco central duro fuera de EE.UU. → USD más débil → leve viento a favor del riesgo.",
+  }],
+  [/\bgdp\b/i, {
+    que: "Producto Interno Bruto: crecimiento de la economía en el trimestre/mes.",
+    crypto: "Fuerte = apetito por riesgo, pero también menos recortes. Débil = miedo a recesión. El contexto decide qué lectura domina.",
+  }],
+  [/ism|pmi|philly fed|manufacturing index|services index/i, {
+    que: "Encuesta a gerentes de compras (PMI/ISM): >50 = expansión del sector, <50 = contracción. Indicador adelantado del ciclo.",
+    crypto: "Sorpresas fuertes mueven el sentimiento risk-on/risk-off general en el que crypto navega. Impacto moderado.",
+  }],
+  [/consumer confidence|consumer sentiment/i, {
+    que: "Confianza del consumidor: qué tan dispuesto está el hogar americano a gastar.",
+    crypto: "Confianza alta apoya al riesgo; los desplomes alimentan la narrativa de recesión. Suele mover poco salvo sorpresa.",
+  }],
+  [/inflation expectations/i, {
+    que: "Expectativas de inflación de los consumidores (encuesta UoM). La Fed la vigila: expectativas desancladas = problema.",
+    crypto: "Expectativas al alza = presión hawkish extra → negativo para riesgo. A la baja = alivio.",
+  }],
+  [/jolts/i, {
+    que: "Vacantes de empleo abiertas (JOLTS): mide cuán caliente está la demanda de trabajadores.",
+    crypto: "Muchas vacantes = mercado laboral apretado = Fed dura. Caídas fuertes anticipan enfriamiento → recortes más cerca.",
+  }],
+  [/bank holiday/i, {
+    que: "Feriado bancario: sin operadores institucionales de esa plaza.",
+    crypto: "Menos liquidez en las horas de esa sesión → movimientos más erráticos y barridos más fáciles. No es un dato, es contexto.",
+  }],
+  [/budget balance/i, {
+    que: "Balance fiscal del gobierno: diferencia entre ingresos y gastos del mes.",
+    crypto: "Impacto directo casi nulo en el intradía; alimenta la narrativa de deuda/emisión que a largo plazo favorece a BTC.",
+  }],
+  [/president trump|president biden|president .* speaks/i, {
+    que: "Discurso presidencial de EE.UU. Puede tocar aranceles, política fiscal o regulación (incluida crypto).",
+    crypto: "Imprevisible: titulares sueltos pueden mover todo el mercado de riesgo en segundos. Si está hablando, no ejecutes entradas.",
+  }],
+];
+
+function eventInfo(title) {
+  for (const [re, info] of EVENT_KB) if (re.test(title)) return info;
+  return {
+    que: "Dato macroeconómico del calendario. Revisa pronóstico vs previo para dimensionar la sorpresa posible.",
+    crypto: "Su efecto sobre crypto llega vía dólar y apetito por riesgo: sorpresas hawkish presionan a BTC, sorpresas dovish lo alivian.",
+  };
+}
+
+// "faltan 2 h 10 min" / "hace 35 min" — para el estado en vivo de cada evento.
+function relTime(deltaMs) {
+  const abs = Math.abs(deltaMs);
+  const m = Math.round(abs / 60000);
+  const txt = m < 60
+    ? `${m} min`
+    : m < 60 * 48
+      ? `${Math.floor(m / 60)} h ${m % 60 ? (m % 60) + " min" : ""}`.trim()
+      : `${Math.round(m / 1440)} días`;
+  return deltaMs >= 0 ? `faltan ${txt}` : `hace ${txt}`;
+}
+
+// Ventana en la que un evento se considera "en curso" (publicación + digestión).
+const LIVE_WINDOW_MS = 45 * 60 * 1000;
+
+function EventDetail({ e, status, deltaMs }) {
+  const info = eventInfo(e.title);
+  const estado = status === "live"
+    ? `EN CURSO — publicado/iniciado ${relTime(deltaMs)}. Mercado digiriendo el dato: cuidado con los barridos del primer impulso.`
+    : status === "past"
+      ? `Ya ocurrió (${relTime(deltaMs)}). El resultado publicado se consulta en la fuente (el feed gratuito no lo incluye).`
+      : `Próximamente: ${relTime(deltaMs)} (${new Date(e.date).toLocaleString("es", { weekday: "short", hour: "2-digit", minute: "2-digit" })}, hora local).`;
+  return (
+    <div className="px-4 py-3 space-y-2 text-[11px] leading-relaxed bg-slate-950/60">
+      <div className={`font-mono text-[10px] uppercase tracking-wider ${
+        status === "live" ? "text-violet-300" : status === "past" ? "text-slate-500" : "text-sky-300"}`}>
+        {estado}
+      </div>
+      <p className="text-slate-300"><span className="text-slate-500">Qué es · </span>{info.que}</p>
+      <p className="text-slate-300"><span className="text-slate-500">Lectura crypto · </span>{info.crypto}</p>
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 font-mono text-[11px]">
+        <span className="text-slate-500">Pronóstico <span className="text-slate-200">{e.forecast || "—"}</span></span>
+        <span className="text-slate-500">Previo <span className="text-slate-200">{e.previous || "—"}</span></span>
+        <a
+          href="https://www.forexfactory.com/calendar"
+          target="_blank" rel="noopener noreferrer"
+          className="inline-flex items-center gap-1 text-sky-400 hover:text-sky-300"
+        >
+          {status === "past" ? "Ver resultado publicado" : "Ver en ForexFactory"} <ExternalLink size={11} />
+        </a>
+      </div>
+    </div>
+  );
+}
+
 function EconomicCalendar() {
   const { events, err } = useEconomicCalendar();
+  const containerRef = useRef(null);
   const nowRowRef = useRef(null);
+  const [selectedKey, setSelectedKey] = useState(null);
   const eventKey = (e) => e.date + "|" + e.title;
+
+  // Reloj en vivo (30 s): el estado AHORA/PRÓXIMO se recalcula solo, sin recargar.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 30000);
+    return () => clearInterval(t);
+  }, []);
 
   const { grouped, currentKey } = useMemo(() => {
     if (!events?.length) return { grouped: [], currentKey: null };
-    const now = Date.now();
-    // El evento "del momento": el próximo que aún no pasó (o el último si ya pasaron todos).
-    const next = events.find((e) => new Date(e.date).getTime() >= now);
-    const currentKey = eventKey(next || events[events.length - 1]);
+    // Evento "del momento": el que está en curso, o el próximo por venir.
+    const live = events.find((e) => {
+      const d = new Date(e.date).getTime() - now;
+      return d <= 0 && d > -LIVE_WINDOW_MS;
+    });
+    const next = events.find((e) => new Date(e.date).getTime() > now);
+    const currentKey = eventKey(live || next || events[events.length - 1]);
     const map = new Map();
     events.forEach((e) => {
       const day = new Date(e.date).toLocaleDateString("es", { weekday: "long", day: "numeric", month: "long" });
@@ -837,12 +987,16 @@ function EconomicCalendar() {
       map.get(day).push(e);
     });
     return { grouped: [...map.entries()], currentKey };
-  }, [events]);
+  }, [events, now]);
 
-  // Al abrir/recargar la página, llevar la vista directo al evento vigente según la hora.
+  // Centrar el evento vigente DENTRO del contenedor del calendario, sin mover
+  // el scroll de la página (la página siempre abre arriba, en los precios).
   useEffect(() => {
-    if (nowRowRef.current) nowRowRef.current.scrollIntoView({ block: "center" });
-  }, [currentKey]);
+    const c = containerRef.current, r = nowRowRef.current;
+    if (!c || !r) return;
+    const delta = r.getBoundingClientRect().top - c.getBoundingClientRect().top;
+    c.scrollTop += delta - c.clientHeight / 2 + r.clientHeight / 2;
+  }, [currentKey, grouped.length]);
 
   return (
     <section className="rounded-xl border border-slate-700/60 bg-slate-900/60 p-4">
@@ -863,7 +1017,7 @@ function EconomicCalendar() {
         <p className="text-xs text-slate-500">Sin eventos de alto/medio impacto relevantes esta semana.</p>
       )}
       {grouped.length > 0 && (
-        <div className="max-h-[450px] overflow-y-auto rounded-md border border-slate-700/60">
+        <div ref={containerRef} className="max-h-[450px] overflow-y-auto rounded-md border border-slate-700/60">
           {grouped.map(([day, evs]) => (
             <div key={day}>
               <div className="sticky top-0 z-10 bg-slate-900/95 px-3 py-2 text-xs font-mono uppercase tracking-wider text-slate-400 border-b border-slate-700/60">
@@ -872,28 +1026,50 @@ function EconomicCalendar() {
               <table className="w-full text-left text-xs">
                 <tbody>
                   {evs.map((e, i) => {
-                    const isCurrent = eventKey(e) === currentKey;
+                    const k = eventKey(e);
+                    const deltaMs = new Date(e.date).getTime() - now;
+                    const status = deltaMs <= 0
+                      ? (deltaMs > -LIVE_WINDOW_MS ? "live" : "past")
+                      : "future";
+                    const isCurrent = k === currentKey;
+                    const isSelected = k === selectedKey;
+                    const tag = status === "live" ? "ahora" : isCurrent && status === "future" ? "próximo" : null;
                     return (
-                      <tr
-                        key={i}
-                        ref={isCurrent ? nowRowRef : null}
-                        className={`border-b border-slate-800/80 hover:bg-slate-800/40 ${
-                          isCurrent ? "bg-violet-500/10 ring-1 ring-inset ring-violet-500/40" : ""
-                        }`}
-                      >
-                        <td className="py-2 pl-3 pr-2 font-mono text-slate-400 whitespace-nowrap w-16">
-                          {isCurrent && <span className="mr-1 inline-block h-1.5 w-1.5 rounded-full bg-violet-400 align-middle animate-pulse" />}
-                          {new Date(e.date).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
-                        </td>
-                        <td className="py-2 px-2 w-10 font-mono text-slate-500">{e.country}</td>
-                        <td className="py-2 px-2 w-12"><ImpactIcon impact={e.impact} /></td>
-                        <td className={`py-2 px-2 ${isCurrent ? "text-violet-200 font-semibold" : "text-slate-200"}`}>
-                          {e.title}
-                          {isCurrent && <span className="ml-2 text-[9px] font-mono uppercase tracking-wider text-violet-400">ahora</span>}
-                        </td>
-                        <td className="py-2 px-2 font-mono text-slate-400 text-right hidden sm:table-cell">{e.forecast || "—"}</td>
-                        <td className="py-2 pr-3 pl-2 font-mono text-slate-500 text-right hidden sm:table-cell">{e.previous || "—"}</td>
-                      </tr>
+                      <React.Fragment key={i}>
+                        <tr
+                          ref={isCurrent ? nowRowRef : null}
+                          onClick={() => setSelectedKey(isSelected ? null : k)}
+                          className={`cursor-pointer border-b border-slate-800/80 hover:bg-slate-800/40 ${
+                            isCurrent ? "bg-violet-500/10 ring-1 ring-inset ring-violet-500/40" : ""
+                          } ${status === "past" && !isCurrent ? "opacity-50" : ""}`}
+                        >
+                          <td className="py-2 pl-3 pr-2 font-mono text-slate-400 whitespace-nowrap w-16">
+                            {status === "live" && <span className="mr-1 inline-block h-1.5 w-1.5 rounded-full bg-violet-400 align-middle animate-pulse" />}
+                            {new Date(e.date).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                          </td>
+                          <td className="py-2 px-2 w-10 font-mono text-slate-500">{e.country}</td>
+                          <td className="py-2 px-2 w-12"><ImpactIcon impact={e.impact} /></td>
+                          <td className={`py-2 px-2 ${isCurrent ? "text-violet-200 font-semibold" : "text-slate-200"}`}>
+                            <span className="mr-1 text-slate-600">{isSelected ? "▾" : "▸"}</span>
+                            {e.title}
+                            {tag && (
+                              <span className={`ml-2 text-[9px] font-mono uppercase tracking-wider ${
+                                tag === "ahora" ? "text-violet-400" : "text-sky-400"}`}>
+                                {tag}{tag === "próximo" ? ` · ${relTime(deltaMs)}` : ""}
+                              </span>
+                            )}
+                          </td>
+                          <td className="py-2 px-2 font-mono text-slate-400 text-right hidden sm:table-cell">{e.forecast || "—"}</td>
+                          <td className="py-2 pr-3 pl-2 font-mono text-slate-500 text-right hidden sm:table-cell">{e.previous || "—"}</td>
+                        </tr>
+                        {isSelected && (
+                          <tr className="border-b border-slate-800/80">
+                            <td colSpan={6}>
+                              <EventDetail e={e} status={status} deltaMs={deltaMs} />
+                            </td>
+                          </tr>
+                        )}
+                      </React.Fragment>
                     );
                   })}
                 </tbody>
@@ -902,7 +1078,9 @@ function EconomicCalendar() {
           ))}
         </div>
       )}
-      <p className="mt-2 text-[11px] text-slate-500">Antes de CPI/FOMC: manos quietas. Iconos: rojo = alto · ámbar = medio. Solo se muestran eventos de alto impacto (cualquier divisa) o impacto medio en USD.</p>
+      <p className="mt-2 text-[11px] text-slate-500">
+        Toca un evento para ver el detalle. Antes de CPI/FOMC: manos quietas. Iconos: rojo = alto · ámbar = medio. Solo eventos de alto impacto (cualquier divisa) o impacto medio en USD.
+      </p>
     </section>
   );
 }
