@@ -1,5 +1,5 @@
 /** @typedef {'ACCUMULATION'|'EXPANSION'|'DISTRIBUTION'|'MANIPULATION'} MarketPhase */
-/** @typedef {'NO_TRADE'|'SWING'|'POSITION'} TradingMode */
+/** @typedef {'NO_TRADE'|'WAIT_TRIGGER'|'SWING'|'POSITION'} TradingMode */
 
 export const MARKET_PHASE = {
   ACCUMULATION: "ACCUMULATION",
@@ -10,6 +10,7 @@ export const MARKET_PHASE = {
 
 export const TRADING_MODE = {
   NO_TRADE: "NO_TRADE",
+  WAIT_TRIGGER: "WAIT_TRIGGER",
   SWING: "SWING",
   POSITION: "POSITION",
 };

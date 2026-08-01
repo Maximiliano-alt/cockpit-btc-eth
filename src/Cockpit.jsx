@@ -1,10 +1,10 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import {
-  Lock, CheckCircle2,
-  Calendar, ExternalLink, ShieldAlert, Target, Radio, RefreshCw,
-  Stethoscope, Wifi, WifiOff
+  Lock, Calendar, ExternalLink, Target, Radio, RefreshCw,
+  Stethoscope, Wifi, WifiOff, MessageCircle
 } from "lucide-react";
 import RiskPortfolioManager from "./ros/RiskPortfolioManager.jsx";
+import TradingBot from "./bot/TradingBot.jsx";
 import { detectStructure, timeframeBias } from "./ros/structure.js";
 
 // ───────────────────────── CONFIG: activos (zonas vienen de IA) ────────────
@@ -289,36 +289,59 @@ function useMacro() {
   return macro;
 }
 
-// Estructura técnica de BTC en 4H + sesgo semanal/mensual — alimenta el
-// veredicto del Risk Manager y el diagnóstico IA con "todas las temporalidades".
+// Sesgo graduado de BTC en 4H / diario / semanal / mensual + gatillos de
+// ejecución. Alimenta el veredicto del Risk Manager y el diagnóstico IA.
 function useBtcStructure(btcCfg) {
-  const [structure, setStructure] = useState(null);
+  const [s, setS] = useState({ timeframes: null, triggers: null });
+  const poiLo = btcCfg?.poi?.lo;
+  const invalidation = btcCfg?.invalidation;
   useEffect(() => {
     let live = true;
     const load = async () => {
       try {
-        const [k4h, k1w, k1M] = await Promise.all([
-          fetchJSON("https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=4h&limit=120"),
-          fetchJSON("https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1w&limit=30"),
-          fetchJSON("https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1M&limit=24"),
+        const [k4h, k1d, k1w, k1M] = await Promise.all([
+          fetchJSON("https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=4h&limit=200"),
+          fetchJSON("https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=200"),
+          fetchJSON("https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1w&limit=120"),
+          fetchJSON("https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1M&limit=60"),
         ]);
         const toC = (k) => k.map((c) => ({ o: +c[1], h: +c[2], l: +c[3], c: +c[4] }));
         const c4h = toC(k4h);
-        const base = detectStructure(c4h, btcCfg?.poi?.lo, btcCfg?.invalidation);
-        if (live) {
-          setStructure({
-            ...base,
-            weeklyBullish: timeframeBias(toC(k1w)),
-            monthlyBullish: timeframeBias(toC(k1M)),
-          });
-        }
+        if (!live) return;
+        setS({
+          timeframes: {
+            h4: timeframeBias(c4h),
+            d1: timeframeBias(toC(k1d)),
+            w1: timeframeBias(toC(k1w)),
+            mn: timeframeBias(toC(k1M)),
+          },
+          triggers: detectStructure(c4h, poiLo, invalidation),
+        });
       } catch { /* sin estructura */ }
     };
     load();
     const t = setInterval(load, 300000);
     return () => { live = false; clearInterval(t); };
-  }, [btcCfg?.poi?.lo, btcCfg?.invalidation]);
-  return structure;
+  }, [poiLo, invalidation]);
+  return s;
+}
+
+// Señal social / de atención (CoinGecko + Reddit vía function, cache 20 min).
+function useSocial() {
+  const [social, setSocial] = useState(null);
+  useEffect(() => {
+    let live = true;
+    const load = async () => {
+      try {
+        const j = await fetchJSON("/.netlify/functions/social", 15000);
+        if (live && j?.assets) setSocial(j);
+      } catch { /* sin datos sociales */ }
+    };
+    load();
+    const t = setInterval(load, 20 * 60 * 1000);
+    return () => { live = false; clearInterval(t); };
+  }, []);
+  return social;
 }
 
 // Mayer Multiple (precio / media 200D) y RSI 22D calculados de velas diarias.
@@ -803,6 +826,7 @@ function ImpactIcon({ impact }) {
 
 function useEconomicCalendar() {
   const [events, setEvents] = useState(null);
+  const [readings, setReadings] = useState({});
   const [err, setErr] = useState(false);
   useEffect(() => {
     let live = true;
@@ -811,12 +835,32 @@ function useEconomicCalendar() {
         const j = await fetchJSON("/.netlify/functions/calendar", 15000);
         if (live && j?.events) { setEvents(j.events); setErr(false); }
       } catch { if (live) setErr(true); }
+      // Lecturas IA de los eventos ya publicados: vienen del cache del
+      // servidor, así que suelen llegar al instante y no gastan cuota.
+      try {
+        const a = await fetchJSON("/.netlify/functions/event-ai", 30000);
+        if (live && a?.readings) setReadings(a.readings);
+      } catch { /* el detalle sigue funcionando sin la lectura IA */ }
     };
     load();
-    const t = setInterval(load, 3600000);
+    const t = setInterval(load, 20 * 60 * 1000);
     return () => { live = false; clearInterval(t); };
   }, []);
-  return { events, err };
+  return { events, readings, err };
+}
+
+// Sorpresa del dato ya publicado respecto al pronóstico.
+function surprise(e) {
+  if (e.actualRaw == null || e.forecastRaw == null) return null;
+  const d = e.actualRaw - e.forecastRaw;
+  if (d === 0) return { dir: 0, label: "en línea", pct: 0 };
+  const pct = (Math.abs(d) / (Math.abs(e.forecastRaw) || 1)) * 100;
+  return {
+    dir: d > 0 ? 1 : -1,
+    pct,
+    label: `${d > 0 ? "+" : "−"}${Math.abs(d).toLocaleString(undefined, { maximumFractionDigits: 2 })} vs pronóstico`,
+    size: pct > 25 ? "grande" : pct > 8 ? "moderada" : "leve",
+  };
 }
 
 // Base de conocimiento local por tipo de evento: qué mide y cómo leerlo para
@@ -927,38 +971,71 @@ function relTime(deltaMs) {
 // Ventana en la que un evento se considera "en curso" (publicación + digestión).
 const LIVE_WINDOW_MS = 45 * 60 * 1000;
 
-function EventDetail({ e, status, deltaMs }) {
+function EventDetail({ e, status, deltaMs, reading }) {
   const info = eventInfo(e.title);
+  const sp = surprise(e);
+  const published = !!e.actual;
   const estado = status === "live"
     ? `EN CURSO — publicado/iniciado ${relTime(deltaMs)}. Mercado digiriendo el dato: cuidado con los barridos del primer impulso.`
     : status === "past"
-      ? `Ya ocurrió (${relTime(deltaMs)}). El resultado publicado se consulta en la fuente (el feed gratuito no lo incluye).`
+      ? `Ya ocurrió (${relTime(deltaMs)})${published ? " · resultado publicado" : " · sin dato numérico (evento cualitativo)"}.`
       : `Próximamente: ${relTime(deltaMs)} (${new Date(e.date).toLocaleString("es", { weekday: "short", hour: "2-digit", minute: "2-digit" })}, hora local).`;
   return (
-    <div className="px-4 py-3 space-y-2 text-[11px] leading-relaxed bg-slate-950/60">
+    <div className="px-4 py-3 space-y-2.5 text-[11px] leading-relaxed bg-slate-950/60">
       <div className={`font-mono text-[10px] uppercase tracking-wider ${
         status === "live" ? "text-violet-300" : status === "past" ? "text-slate-500" : "text-sky-300"}`}>
         {estado}
       </div>
+
+      {published && (
+        <div className="flex flex-wrap items-center gap-2 rounded-md border border-slate-700 bg-slate-900/70 px-3 py-2 font-mono text-[11px]">
+          <span className="text-slate-500">Resultado</span>
+          <span className={`text-sm font-bold ${
+            !sp || sp.dir === 0 ? "text-slate-100" : sp.dir > 0 ? "text-emerald-300" : "text-rose-300"}`}>
+            {e.actual}
+          </span>
+          <span className="text-slate-600">·</span>
+          <span className="text-slate-500">pronóstico <span className="text-slate-300">{e.forecast || "—"}</span></span>
+          <span className="text-slate-600">·</span>
+          <span className="text-slate-500">previo <span className="text-slate-300">{e.previous || "—"}</span></span>
+          {sp && (
+            <span className={`ml-auto px-1.5 py-0.5 rounded text-[10px] border ${
+              sp.dir === 0 ? "border-slate-600 text-slate-400"
+              : sp.dir > 0 ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
+              : "border-rose-500/40 bg-rose-500/10 text-rose-300"}`}>
+              {sp.dir === 0 ? "en línea" : `${sp.label} · sorpresa ${sp.size}`}
+            </span>
+          )}
+        </div>
+      )}
+
+      {reading && (
+        <div className="rounded-md border border-violet-500/30 bg-violet-500/5 px-3 py-2">
+          <div className="font-mono text-[9px] uppercase tracking-wider text-violet-400 mb-1">
+            Lectura IA del resultado
+          </div>
+          <p className="text-slate-200">{reading}</p>
+        </div>
+      )}
+      {published && !reading && (
+        <p className="text-slate-600 text-[10px] font-mono">Generando lectura IA del resultado…</p>
+      )}
+
       <p className="text-slate-300"><span className="text-slate-500">Qué es · </span>{info.que}</p>
-      <p className="text-slate-300"><span className="text-slate-500">Lectura crypto · </span>{info.crypto}</p>
-      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 font-mono text-[11px]">
-        <span className="text-slate-500">Pronóstico <span className="text-slate-200">{e.forecast || "—"}</span></span>
-        <span className="text-slate-500">Previo <span className="text-slate-200">{e.previous || "—"}</span></span>
-        <a
-          href="https://www.forexfactory.com/calendar"
-          target="_blank" rel="noopener noreferrer"
-          className="inline-flex items-center gap-1 text-sky-400 hover:text-sky-300"
-        >
-          {status === "past" ? "Ver resultado publicado" : "Ver en ForexFactory"} <ExternalLink size={11} />
-        </a>
-      </div>
+      <p className="text-slate-300"><span className="text-slate-500">Cómo leerlo · </span>{info.crypto}</p>
+      {!published && (
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 font-mono text-[11px]">
+          <span className="text-slate-500">Pronóstico <span className="text-slate-200">{e.forecast || "—"}</span></span>
+          <span className="text-slate-500">Previo <span className="text-slate-200">{e.previous || "—"}</span></span>
+        </div>
+      )}
+      {e.source && <p className="text-slate-600 text-[10px] font-mono">Fuente: {e.source}{e.period ? ` · periodo ${e.period}` : ""}</p>}
     </div>
   );
 }
 
 function EconomicCalendar() {
-  const { events, err } = useEconomicCalendar();
+  const { events, readings, err } = useEconomicCalendar();
   const containerRef = useRef(null);
   const nowRowRef = useRef(null);
   const [selectedKey, setSelectedKey] = useState(null);
@@ -1034,6 +1111,7 @@ function EconomicCalendar() {
                     const isCurrent = k === currentKey;
                     const isSelected = k === selectedKey;
                     const tag = status === "live" ? "ahora" : isCurrent && status === "future" ? "próximo" : null;
+                    const sp = surprise(e);
                     return (
                       <React.Fragment key={i}>
                         <tr
@@ -1059,13 +1137,23 @@ function EconomicCalendar() {
                               </span>
                             )}
                           </td>
-                          <td className="py-2 px-2 font-mono text-slate-400 text-right hidden sm:table-cell">{e.forecast || "—"}</td>
-                          <td className="py-2 pr-3 pl-2 font-mono text-slate-500 text-right hidden sm:table-cell">{e.previous || "—"}</td>
+                          <td className="py-2 px-2 font-mono text-right w-16 hidden sm:table-cell">
+                            {e.actual ? (
+                              <span className={
+                                !sp || sp.dir === 0 ? "text-slate-100 font-bold"
+                                : sp.dir > 0 ? "text-emerald-300 font-bold" : "text-rose-300 font-bold"
+                              } title={sp ? `${sp.label} · sorpresa ${sp.size}` : "resultado publicado"}>
+                                {e.actual}
+                              </span>
+                            ) : <span className="text-slate-600">—</span>}
+                          </td>
+                          <td className="py-2 px-2 font-mono text-slate-400 text-right w-14 hidden md:table-cell">{e.forecast || "—"}</td>
+                          <td className="py-2 pr-3 pl-2 font-mono text-slate-500 text-right w-14 hidden md:table-cell">{e.previous || "—"}</td>
                         </tr>
                         {isSelected && (
                           <tr className="border-b border-slate-800/80">
-                            <td colSpan={6}>
-                              <EventDetail e={e} status={status} deltaMs={deltaMs} />
+                            <td colSpan={7}>
+                              <EventDetail e={e} status={status} deltaMs={deltaMs} reading={readings?.[e.id]} />
                             </td>
                           </tr>
                         )}
@@ -1079,7 +1167,7 @@ function EconomicCalendar() {
         </div>
       )}
       <p className="mt-2 text-[11px] text-slate-500">
-        Toca un evento para ver el detalle. Antes de CPI/FOMC: manos quietas. Iconos: rojo = alto · ámbar = medio. Solo eventos de alto impacto (cualquier divisa) o impacto medio en USD.
+        Toca un evento para ver el resultado publicado y la lectura IA. Columnas: resultado · pronóstico · previo — verde = salió por encima de lo esperado, rojo = por debajo. Antes de CPI/FOMC: manos quietas.
       </p>
     </section>
   );
@@ -1211,7 +1299,7 @@ function Playbook({ data, aiModel, loading }) {
           </span>
         ) : null}
       </div>
-      <p className="text-[11px] text-slate-500 mb-3">Escenarios, no señales. Antes de ejecutar: confirma R:R ≥ 1.5 y revisa la compuerta pre-trade.</p>
+      <p className="text-[11px] text-slate-500 mb-3">Escenarios, no señales. Antes de ejecutar: confirma R:R ≥ 1.5 y que el veredicto del día lo permita.</p>
       <div className="grid gap-3 lg:grid-cols-3">
         {rows.map((h) => (
           <div key={h.horizon} className="rounded-lg border border-slate-700/60 bg-slate-950/40 p-3">
@@ -1240,33 +1328,6 @@ function Playbook({ data, aiModel, loading }) {
   );
 }
 
-// ───────────────────────── checklist pre-trade ──────────────────────────────
-const CHECKS = [
-  "Veredicto de hoy (Risk & Portfolio Manager) revisado ANTES de ejecutar",
-  "El activo es BTC o ETH (nada más)",
-  "R:R ≥ 1.5 confirmado",
-  "Entrada en POI estructural, NO en número redondo",
-  "Stop por DEBAJO del cluster retail obvio",
-  "Sin evento macro de alto impacto pendiente (CPI/FOMC)",
-];
-// Lista de referencia, sin interacción — el control real es el veredicto del Risk Manager.
-function Checklist() {
-  return (
-    <div className="rounded-lg border border-slate-700/60 bg-slate-900/50 p-4">
-      <div className="flex items-center gap-2 mb-3"><ShieldAlert size={16} className="text-slate-300" /><h3 className="font-mono text-sm tracking-wide text-slate-200">Compuerta pre-trade (referencia)</h3></div>
-      <ul className="space-y-1.5">
-        {CHECKS.map((c, i) => (
-          <li key={i} className="flex items-start gap-2.5">
-            <CheckCircle2 size={14} className="text-slate-500 mt-0.5 shrink-0" />
-            <span className="text-xs text-slate-400">{c}</span>
-          </li>
-        ))}
-      </ul>
-      <p className="mt-3 text-[11px] text-slate-500">Si una sola no se cumple, no hay trade.</p>
-    </div>
-  );
-}
-
 // ───────────────────────── app ─────────────────────────────────────────────
 export default function Cockpit() {
   const { data: prices, status, updated, reload } = useLivePrices();
@@ -1276,6 +1337,7 @@ export default function Cockpit() {
   const onchain = useOnchain();
   const daily = useBtcDaily();
   const macro = useMacro();
+  const social = useSocial();
   const btc = prices.BTCUSDT?.price ?? null;
   const eth = prices.ETHUSDT?.price ?? null;
   const sol = prices.SOLUSDT?.price ?? null;
@@ -1309,9 +1371,9 @@ export default function Cockpit() {
     return out;
   }, [aiZones]);
 
-  // Estructura técnica multi-temporal de BTC (4H + semanal + mensual) —
-  // alimenta el veredicto del Risk Manager y el resumen completo de la IA.
-  const structure = useBtcStructure(mergedAssets.BTCUSDT);
+  // Sesgo multi-temporal de BTC (4H / diario / semanal / mensual) — alimenta
+  // el veredicto del Risk Manager y el resumen completo de la IA.
+  const { timeframes, triggers } = useBtcStructure(mergedAssets.BTCUSDT);
 
   ctxRef.current = {
     precios: { btc, eth, sol },
@@ -1329,15 +1391,13 @@ export default function Cockpit() {
     rsi22d: daily?.rsi22 ?? null,
     zonasIA: aiZones?.zones ?? null,
     macro: macro ? { dxy: macro.dxy ?? null, sp500: macro.sp500 ?? null } : null,
-    estructuraBTC: structure ? {
-      choch4h: structure.choch4h,
-      bos4h: structure.bos4h,
-      liquiditySweep: structure.liquiditySweep,
-      htfBullish: structure.htfBullish,
-      weeklyBullish: structure.weeklyBullish,
-      monthlyBullish: structure.monthlyBullish,
-      trend: structure.trend,
+    social: social?.assets ?? null,
+    // Sesgo -100..+100 por temporalidad, más los gatillos del 4H.
+    sesgoPorTemporalidad: timeframes ? {
+      h4: timeframes.h4?.score, diario: timeframes.d1?.score,
+      semanal: timeframes.w1?.score, mensual: timeframes.mn?.score,
     } : null,
+    gatillos4H: triggers ?? null,
   };
 
   const Live = ({ label, value, sub, tone }) => (
@@ -1443,30 +1503,72 @@ export default function Cockpit() {
               sub={onchain?.altseason ? (onchain.altseason.value >= 75 ? "Altseason" : onchain.altseason.value <= 25 ? "Bitcoin season" : "NO altseason") : "CoinMarketCap"}
               tone={onchain?.altseason ? (onchain.altseason.value >= 75 ? toneClasses.danger : toneClasses.warn) : toneClasses.warn} />
           </div>
+
+          {/* menciones y atención social */}
+          <div className="flex items-center gap-2 mb-2 mt-4">
+            <MessageCircle size={15} className="text-emerald-400" />
+            <h2 className="text-sm font-mono tracking-wide text-slate-300">Menciones sociales — atención y sentimiento</h2>
+            {social?.reddit?.sample && (
+              <span className="text-[10px] font-mono text-slate-500">r/CryptoCurrency · {social.reddit.sample} posts</span>
+            )}
+          </div>
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2">
+            {["BTC", "ETH", "SOL"].map((sym) => {
+              const a = social?.assets?.[sym];
+              const rd = a?.reddit;
+              return (
+                <React.Fragment key={sym}>
+                  <Live
+                    label={`${sym} · menciones`}
+                    value={rd ? String(rd.mentions) : a?.trendingRank ? `#${a.trendingRank}` : "—"}
+                    sub={rd
+                      ? `${rd.upvotes.toLocaleString()} upvotes · ${rd.comments.toLocaleString()} coment.`
+                      : a?.trendingRank ? "ranking de tendencia CoinGecko" : "sin datos"}
+                    tone={rd
+                      ? (rd.mentions >= 12 ? toneClasses.danger : rd.mentions >= 5 ? toneClasses.warn : toneClasses.good)
+                      : toneClasses.warn}
+                  />
+                  <Live
+                    label={`${sym} · sentimiento`}
+                    value={a?.sentimentUp != null ? `${a.sentimentUp}%` : "—"}
+                    sub={a?.sentimentUp != null
+                      ? (a.sentimentUp >= 70 ? "Optimismo alto" : a.sentimentUp <= 45 ? "Pesimismo" : "Mixto")
+                      : "comunidad CoinGecko"}
+                    tone={a?.sentimentUp != null
+                      ? (a.sentimentUp >= 80 ? toneClasses.danger : a.sentimentUp <= 45 ? toneClasses.good : toneClasses.warn)
+                      : toneClasses.warn}
+                  />
+                </React.Fragment>
+              );
+            })}
+          </div>
+          {social?.trending?.length > 0 && (
+            <p className="mt-2 text-[10px] font-mono text-slate-500">
+              Tendencia global: {social.trending.map((t) => `${t.rank}. ${t.symbol}`).join("  ·  ")}
+            </p>
+          )}
+          <p className="mt-1 text-[10px] text-slate-600">
+            Mucha mención + sentimiento muy optimista suele marcar techos locales; silencio con pesimismo suele marcar suelos.
+          </p>
         </section>
 
         <RiskPortfolioManager
-          btc={btc}
-          eth={eth}
-          btcChange={prices.BTCUSDT?.change ?? null}
-          ethChange={prices.ETHUSDT?.change ?? null}
           fg={fg}
           etf={etf}
           derivs={derivs}
           onchain={onchain}
           daily={daily}
           macro={macro}
-          structure={structure}
+          timeframes={timeframes}
+          triggers={triggers}
           btcCfg={mergedAssets.BTCUSDT}
-          ethCfg={mergedAssets.ETHUSDT}
         />
+
+        <TradingBot />
 
         <Diagnosis btc={btc} fg={fg} etf={etf} onchain={onchain} ai={ai} cfg={mergedAssets.BTCUSDT} zonesLoading={zonesLoading} />
 
         <Playbook data={aiZones?.playbook} aiModel={aiZones?.model} loading={zonesLoading} />
-
-        {/* disciplina */}
-        <Checklist />
 
         {/* fuentes */}
         <section className="rounded-xl border border-slate-700/60 bg-slate-900/60 p-4">

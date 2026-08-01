@@ -8,7 +8,10 @@
 //    reintentando en loop.
 import { getStore } from "@netlify/blobs";
 
-export async function withAiCache({ key, ttlMs, cooldownMs = 10 * 60 * 1000, force = false, generate }) {
+// `signature`: si cambia, el cache se considera vencido aunque no haya
+// expirado el TTL. Sirve para regenerar cuando cambian los datos de entrada
+// (p. ej. se publicó el resultado de un evento nuevo) sin bajar el TTL.
+export async function withAiCache({ key, ttlMs, cooldownMs = 10 * 60 * 1000, force = false, signature = null, generate }) {
   // strong: una escritura recién hecha (p.ej. regeneración de otra pestaña)
   // se ve de inmediato; con la consistencia eventual por defecto la lectura
   // podía devolver la versión vieja durante ~1 min.
@@ -16,9 +19,10 @@ export async function withAiCache({ key, ttlMs, cooldownMs = 10 * 60 * 1000, for
   let entry = null;
   try { entry = await store.get(key, { type: "json" }); } catch { /* sin cache previo */ }
   const now = Date.now();
+  const sigOk = signature == null || entry?.signature === signature;
 
   if (!force) {
-    if (entry?.data && now - entry.at < ttlMs) {
+    if (entry?.data && sigOk && now - entry.at < ttlMs) {
       return { data: entry.data, served: "cache" };
     }
     // Falló hace poco: no reintentar todavía; servir lo último que haya.
@@ -30,7 +34,7 @@ export async function withAiCache({ key, ttlMs, cooldownMs = 10 * 60 * 1000, for
 
   try {
     const data = await generate();
-    await store.setJSON(key, { at: now, data });
+    await store.setJSON(key, { at: now, signature, data });
     return { data, served: "generated" };
   } catch (e) {
     try { await store.setJSON(key, { ...(entry || { at: 0 }), lastFailAt: now }); } catch { /* best effort */ }
