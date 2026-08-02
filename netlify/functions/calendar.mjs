@@ -19,10 +19,15 @@ const COUNTRIES = Object.keys(CURRENCY).join(",");
 // importance: 1 = alto, 0 = medio, -1 = bajo.
 const IMPACT = { 1: "High", 0: "Medium", "-1": "Low" };
 
+// Series de impacto medio que TradingView marca como USD pero que no mueven
+// el apetito de riesgo: inventarios de energía, hipotecas, subastas de deuda.
+const NOISE = /EIA |API Crude|Baker Hughes|MBA |Mortgage|Redbook|Auction|Tender|Bill |Note |Bond |Imports$|Exports$|Stocks Change/i;
+
 // El driver macro de BTC/ETH es la política monetaria y la liquidez en USD:
 // alto impacto de cualquier divisa mueve el apetito de riesgo global, y el
-// impacto medio solo importa si es de EE.UU.
+// impacto medio solo importa si es de EE.UU. y no es ruido sectorial.
 function isCryptoRelevant(e) {
+  if (NOISE.test(e.title)) return false;
   if (e.impact === "High") return true;
   return e.impact === "Medium" && e.country === "USD";
 }
