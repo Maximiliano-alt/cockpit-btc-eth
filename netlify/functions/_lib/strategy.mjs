@@ -7,23 +7,18 @@
 // auditables sobre esas zonas + el sesgo multi-temporal.
 import { timeframeBias, detectStructure } from "../../../src/ros/structure.js";
 import { compositeBias } from "../../../src/ros/decisionEngine.js";
-
-const BINANCE = "https://api.binance.com/api/v3";
-
-async function klines(symbol, interval, limit) {
-  const res = await fetch(`${BINANCE}/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
-  if (!res.ok) throw new Error(`klines ${symbol} ${interval}: HTTP ${res.status}`);
-  const j = await res.json();
-  return j.map((c) => ({ o: +c[1], h: +c[2], l: +c[3], c: +c[4] }));
-}
+// Mismo obtenedor con respaldo que usa el cockpit: importante acá porque las
+// functions de Netlify corren en AWS, y Binance geobloquea las IPs de EE.UU.
+// Sin el respaldo a Coinbase, el bot se quedaría ciego en producción.
+import { fetchCandles } from "../../../src/data/candles.js";
 
 /** Sesgo y gatillos de un símbolo, calculados sobre el mercado REAL. */
 export async function analyzeSymbol(symbol, zone) {
   const [c4h, c1d, c1w, c1M] = await Promise.all([
-    klines(symbol, "4h", 200),
-    klines(symbol, "1d", 200),
-    klines(symbol, "1w", 120),
-    klines(symbol, "1M", 60),
+    fetchCandles(symbol, "4h", 200),
+    fetchCandles(symbol, "1d", 200),
+    fetchCandles(symbol, "1w", 120),
+    fetchCandles(symbol, "1M", 60),
   ]);
   const timeframes = {
     h4: timeframeBias(c4h), d1: timeframeBias(c1d),

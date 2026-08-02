@@ -6,6 +6,7 @@ import {
 import RiskPortfolioManager from "./ros/RiskPortfolioManager.jsx";
 import TradingBot from "./bot/TradingBot.jsx";
 import { detectStructure, timeframeBias } from "./ros/structure.js";
+import { fetchCandles, fetchPrices } from "./data/candles.js";
 
 // ───────────────────────── CONFIG: activos (zonas vienen de IA) ────────────
 const ASSETS = {
@@ -133,31 +134,12 @@ function useLivePrices() {
 
   const load = useCallback(async () => {
     try {
-      const url = "https://api.binance.com/api/v3/ticker/24hr?symbols=" +
-        encodeURIComponent('["BTCUSDT","ETHUSDT","SOLUSDT"]');
-      const arr = await fetchJSON(url);
-      const next = {};
-      arr.forEach((t) => {
-        next[t.symbol] = { price: parseFloat(t.lastPrice), change: parseFloat(t.priceChangePercent) };
-      });
+      const { data: next } = await fetchPrices();
       setData(next);
       setStatus("live");
       setUpdated(new Date());
     } catch {
-      try {
-        const cg = await fetchJSON(
-          "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana&vs_currencies=usd&include_24hr_change=true"
-        );
-        setData({
-          BTCUSDT: { price: cg.bitcoin.usd, change: cg.bitcoin.usd_24h_change },
-          ETHUSDT: { price: cg.ethereum.usd, change: cg.ethereum.usd_24h_change },
-          SOLUSDT: { price: cg.solana.usd, change: cg.solana.usd_24h_change },
-        });
-        setStatus("live");
-        setUpdated(new Date());
-      } catch {
-        setStatus("offline");
-      }
+      setStatus("offline");
     }
   }, []);
 
@@ -299,21 +281,19 @@ function useBtcStructure(btcCfg) {
     let live = true;
     const load = async () => {
       try {
-        const [k4h, k1d, k1w, k1M] = await Promise.all([
-          fetchJSON("https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=4h&limit=200"),
-          fetchJSON("https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=200"),
-          fetchJSON("https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1w&limit=120"),
-          fetchJSON("https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1M&limit=60"),
+        const [c4h, c1d, c1w, c1M] = await Promise.all([
+          fetchCandles("BTCUSDT", "4h", 200),
+          fetchCandles("BTCUSDT", "1d", 200),
+          fetchCandles("BTCUSDT", "1w", 120),
+          fetchCandles("BTCUSDT", "1M", 60),
         ]);
-        const toC = (k) => k.map((c) => ({ o: +c[1], h: +c[2], l: +c[3], c: +c[4] }));
-        const c4h = toC(k4h);
         if (!live) return;
         setS({
           timeframes: {
             h4: timeframeBias(c4h),
-            d1: timeframeBias(toC(k1d)),
-            w1: timeframeBias(toC(k1w)),
-            mn: timeframeBias(toC(k1M)),
+            d1: timeframeBias(c1d),
+            w1: timeframeBias(c1w),
+            mn: timeframeBias(c1M),
           },
           triggers: detectStructure(c4h, poiLo, invalidation),
         });
@@ -351,8 +331,8 @@ function useBtcDaily() {
     let live = true;
     const load = async () => {
       try {
-        const j = await fetchJSON("https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=260");
-        const closes = j.map((k) => +k[4]);
+        const c = await fetchCandles("BTCUSDT", "1d", 260);
+        const closes = c.map((k) => k.c);
         if (closes.length < 222) return;
         const last = closes[closes.length - 1];
         const ma200 = closes.slice(-200).reduce((a, b) => a + b, 0) / 200;
@@ -415,10 +395,10 @@ function useAiZones(online, ctxRef) {
         const syms = ["BTCUSDT", "ETHUSDT", "SOLUSDT"];
         const assets = {};
         await Promise.all(syms.map(async (s) => {
-          const k = await fetchJSON(`https://api.binance.com/api/v3/klines?symbol=${s}&interval=1d&limit=120`);
+          const k = await fetchCandles(s, "1d", 120);
           assets[s] = {
-            price: +k[k.length - 1][4],
-            velasDiarias: k.map((c) => [+(+c[2]).toPrecision(6), +(+c[3]).toPrecision(6), +(+c[4]).toPrecision(6)]),
+            price: k[k.length - 1].c,
+            velasDiarias: k.map((c) => [+c.h.toPrecision(6), +c.l.toPrecision(6), +c.c.toPrecision(6)]),
           };
         }));
         const { zonasIA, ...contexto } = ctxRef.current || {};
@@ -448,11 +428,10 @@ function useKlines(symbol, interval) {
     setCandles(null); setErr(false);
     const load = async () => {
       try {
-        const j = await fetchJSON(
-          `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=400`
-        );
+        const c = await fetchCandles(symbol, interval, 400);
         if (!live) return;
-        setCandles(j.map((k) => ({ t: +k[0], o: +k[1], h: +k[2], l: +k[3], c: +k[4] })));
+        setCandles(c);
+        setErr(false);
       } catch {
         if (live) setErr(true);
       }
