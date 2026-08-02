@@ -7,7 +7,14 @@ async function api(body) {
     headers: body ? { "Content-Type": "application/json" } : undefined,
     body: body ? JSON.stringify(body) : undefined,
   });
-  const j = await res.json().catch(() => ({}));
+  // Cuidado: en desarrollo local (sin functions) el servidor devuelve el HTML
+  // del SPA con estado 200. Sin esta comprobación, `j` quedaba vacío y el
+  // panel reventaba al leer config.armed, tumbando todo el cockpit.
+  const text = await res.text();
+  let j;
+  try { j = JSON.parse(text); } catch {
+    throw new Error(res.ok ? "El backend del bot no está disponible aquí (functions no activas)." : `HTTP ${res.status}`);
+  }
   if (!res.ok) throw new Error(j.error || `HTTP ${res.status}`);
   return j;
 }
@@ -89,8 +96,12 @@ export default function TradingBot() {
   const [lastRun, setLastRun] = useState(null);
 
   const load = useCallback(async () => {
-    try { setState(await api()); setErr(null); }
-    catch (e) { setErr(String(e.message || e)); }
+    try {
+      const s = await api();
+      if (!s?.config) throw new Error("Respuesta inesperada del backend del bot.");
+      setState(s);
+      setErr(null);
+    } catch (e) { setErr(String(e.message || e)); }
   }, []);
 
   useEffect(() => {
@@ -110,7 +121,7 @@ export default function TradingBot() {
     finally { setBusy(false); }
   };
 
-  if (!state) {
+  if (!state?.config) {
     return (
       <section className="rounded-xl border border-slate-700/60 bg-slate-900/60 p-4">
         <div className="flex items-center gap-2 mb-2">
@@ -122,7 +133,7 @@ export default function TradingBot() {
     );
   }
 
-  const { config, account, env, log } = state;
+  const { config, account = { connected: false, reason: "sin datos" }, env = {}, log = [] } = state;
   const armed = config.armed;
   const decisions = lastRun?.decisions || log?.[0]?.decisions || [];
 
