@@ -3,3 +3,4 @@ dist
 .env
 .netlify
 .claude
+.cache-research
