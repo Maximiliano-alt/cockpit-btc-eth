@@ -12,18 +12,35 @@
 // imposible que apunte a producción, aunque la configuración venga mal.
 import crypto from "node:crypto";
 
-const HOSTS = {
-  demo: "https://testnet.binancefuture.com",
-  live: "https://fapi.binance.com",
+// Binance tiene DOS entornos demo de futuros con claves distintas y no
+// intercambiables:
+//   · testnet.binancefuture.com → testnet clásico, registro aparte.
+//   · demo-fapi.binance.com     → "Binance Demo Trading" (demo.binance.com).
+//
+// El predeterminado es el testnet clásico por un motivo medido, no por gusto:
+// Binance bloquea por geolocalización y las functions corren en AWS us-east-2.
+// Comprobado desde el propio servidor (bot-control?diag=1):
+//   testnet.binancefuture.com → 200 ✓
+//   demo-fapi.binance.com     → 451 (bloqueado)
+//   fapi.binance.com          → 451 (bloqueado)
+// Es decir, desde Netlify SOLO se puede operar contra el testnet clásico.
+const DEMO_HOSTS = {
+  testnet: "https://testnet.binancefuture.com",
+  demo: "https://demo-fapi.binance.com",
 };
 
-let symbolInfoCache = { at: 0, mode: null, data: null };
+function demoHost() {
+  const v = (process.env.BROKER_DEMO_HOST || "testnet").trim();
+  return DEMO_HOSTS[v] || (v.startsWith("https://") ? v : DEMO_HOSTS.testnet);
+}
+
+let symbolInfoCache = { at: 0, host: null, data: null };
 
 export class BinanceFutures {
   constructor({ mode = "demo", apiKey, apiSecret }) {
-    if (!HOSTS[mode]) throw new Error("Modo de broker inválido: " + mode);
+    if (mode !== "demo" && mode !== "live") throw new Error("Modo de broker inválido: " + mode);
     this.mode = mode;
-    this.host = HOSTS[mode];
+    this.host = mode === "live" ? "https://fapi.binance.com" : demoHost();
     this.apiKey = apiKey;
     this.apiSecret = apiSecret;
   }
@@ -70,7 +87,7 @@ export class BinanceFutures {
 
   /** Filtros de precisión (paso de cantidad, tick de precio, notional mínimo). */
   async symbolInfo() {
-    if (symbolInfoCache.data && symbolInfoCache.mode === this.mode
+    if (symbolInfoCache.data && symbolInfoCache.host === this.host
         && Date.now() - symbolInfoCache.at < 6 * 3600e3) {
       return symbolInfoCache.data;
     }
@@ -87,8 +104,64 @@ export class BinanceFutures {
         pricePrecision: s.pricePrecision ?? 2,
       };
     }
-    symbolInfoCache = { at: Date.now(), mode: this.mode, data };
+    symbolInfoCache = { at: Date.now(), host: this.host, data };
     return data;
+  }
+
+  /** Órdenes pendientes (stops y objetivos que aún no se han disparado). */
+  async openOrders(symbol) {
+    const r = await this.#request("GET", "/fapi/v1/openOrders", symbol ? { symbol } : {}, true);
+    return (Array.isArray(r) ? r : []).map((o) => ({
+      symbol: o.symbol,
+      id: o.orderId,
+      side: o.side,
+      type: o.type,
+      qty: parseFloat(o.origQty || 0),
+      price: parseFloat(o.price || 0),
+      stopPrice: parseFloat(o.stopPrice || 0),
+      reduceOnly: !!o.reduceOnly || !!o.closePosition,
+      at: o.time || o.updateTime,
+    }));
+  }
+
+  /**
+   * Historial de operaciones cerradas. Se arma con el flujo de ingresos
+   * (REALIZED_PNL, COMMISSION, FUNDING_FEE) porque es la única fuente que da
+   * el P&L REALIZADO de verdad: las ejecuciones sueltas no dicen cuánto se
+   * ganó, solo qué se compró y vendió.
+   */
+  async closedTrades(days = 30) {
+    const startTime = Date.now() - days * 864e5;
+    const rows = await this.#request("GET", "/fapi/v1/income", { startTime, limit: 1000 }, true);
+    const list = Array.isArray(rows) ? rows : [];
+
+    // Agrupamos por símbolo + momento para reconstruir cada cierre con sus
+    // comisiones y financiación asociadas.
+    const closes = [];
+    let fees = 0, funding = 0, realized = 0;
+    for (const r of list) {
+      const v = parseFloat(r.income || 0);
+      if (r.incomeType === "COMMISSION") fees += v;
+      else if (r.incomeType === "FUNDING_FEE") funding += v;
+      else if (r.incomeType === "REALIZED_PNL") {
+        realized += v;
+        closes.push({ symbol: r.symbol, pnl: v, at: r.time, asset: r.asset });
+      }
+    }
+    closes.sort((a, b) => b.at - a.at);
+    const wins = closes.filter((c) => c.pnl > 0);
+    return {
+      trades: closes.slice(0, 50),
+      count: closes.length,
+      realized,
+      fees,
+      funding,
+      net: realized + fees + funding,  // comisiones y funding ya vienen negativos
+      winRate: closes.length ? (wins.length / closes.length) * 100 : 0,
+      bestPnl: closes.length ? Math.max(...closes.map((c) => c.pnl)) : 0,
+      worstPnl: closes.length ? Math.min(...closes.map((c) => c.pnl)) : 0,
+      days,
+    };
   }
 
   async account() {
@@ -146,6 +219,14 @@ export class BinanceFutures {
       }
     }
     return { entryOrderId: entry.orderId, status: entry.status, protectors };
+  }
+
+  /** Orden a mercado simple, sin stop ni objetivo asociados. */
+  async marketOrder({ symbol, side, quantity }) {
+    const r = await this.#request("POST", "/fapi/v1/order", {
+      symbol, side, type: "MARKET", quantity,
+    }, true);
+    return { orderId: r.orderId, status: r.status };
   }
 
   async closePosition(symbol, amt) {

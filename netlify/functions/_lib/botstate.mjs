@@ -3,39 +3,48 @@ import { getStore } from "@netlify/blobs";
 
 const store = () => getStore({ name: "bot", consistency: "strong" });
 
+// Configuración de la estrategia de ASIGNACIÓN DE TENDENCIA — la única que
+// superó la Compuerta 0 (ver tools/trend.mjs). No hay stop ni objetivo: se
+// está dentro mientras el cierre diario supere su media, y en efectivo si no.
+// No hay cortos ni apalancamiento: ambos empeoraron el resultado en las
+// pruebas sobre 7 años.
 export const DEFAULT_CONFIG = {
   armed: false,            // interruptor principal: sin esto el bot solo simula
-  mode: "demo",            // "demo" = testnet. "live" exige además BOT_ALLOW_LIVE
+  mode: "demo",            // "demo" = cuenta demo. "live" exige además BOT_ALLOW_LIVE
+  strategy: "trend",
   symbols: ["BTCUSDT", "ETHUSDT"],
-  riskPctPerTrade: 1,      // % del capital arriesgado hasta el stop
-  maxConcurrent: 2,
-  maxLeverage: 3,
-  minScore: 25,            // |sesgo compuesto| mínimo para operar
-  minAlignment: 50,        // % de temporalidades que deben coincidir
-  minRR: 1.5,
-  maxChasePct: 3,          // no perseguir: máx. % por encima del POI para entrar
-  dailyLossLimitPct: 5,    // pérdida diaria que apaga el bot
-  cooldownMin: 90,         // espera mínima entre operaciones del mismo símbolo
-  allowShorts: true,
+  maPeriod: 50,            // media de referencia (50 fue la mejor en la prueba)
+  allocationPct: 90,       // % del capital que se reparte entre los símbolos
+  dailyLossLimitPct: 5,    // pérdida diaria que desarma el bot y cierra todo
 };
+
+// Campos del motor antiguo (operaciones con stop) que ya no se usan. Se
+// descartan al leer para que una configuración guardada antes no reviva
+// cortos ni apalancamiento.
+const OBSOLETE = [
+  "riskPctPerTrade", "maxConcurrent", "maxLeverage", "minScore",
+  "minAlignment", "minRR", "maxChasePct", "cooldownMin", "allowShorts",
+];
 
 export async function getConfig() {
   try {
-    const c = await store().get("config", { type: "json" });
-    return { ...DEFAULT_CONFIG, ...(c || {}) };
+    const c = (await store().get("config", { type: "json" })) || {};
+    for (const k of OBSOLETE) delete c[k];
+    return { ...DEFAULT_CONFIG, ...c, strategy: "trend" };
   } catch { return { ...DEFAULT_CONFIG }; }
 }
 
 export async function setConfig(patch) {
   const cur = await getConfig();
+  const next = { ...cur, ...patch };
+  for (const k of OBSOLETE) delete next[k];
   // El modo "live" nunca se puede activar desde la UI: exige una variable de
   // entorno que solo el dueño de la cuenta puede poner en Netlify.
-  const next = { ...cur, ...patch };
   if (next.mode === "live" && process.env.BOT_ALLOW_LIVE !== "true") next.mode = "demo";
-  next.riskPctPerTrade = Math.min(5, Math.max(0.1, Number(next.riskPctPerTrade) || 1));
-  next.maxLeverage = Math.min(10, Math.max(1, Number(next.maxLeverage) || 3));
-  next.maxConcurrent = Math.min(4, Math.max(1, Number(next.maxConcurrent) || 2));
-  next.minRR = Math.max(1, Number(next.minRR) || 1.5);
+  next.strategy = "trend";
+  next.maPeriod = Math.min(200, Math.max(10, Math.round(Number(next.maPeriod) || 50)));
+  next.allocationPct = Math.min(100, Math.max(10, Number(next.allocationPct) || 90));
+  next.dailyLossLimitPct = Math.min(50, Math.max(1, Number(next.dailyLossLimitPct) || 5));
   await store().setJSON("config", next);
   return next;
 }
