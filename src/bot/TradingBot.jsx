@@ -187,7 +187,7 @@ function TradeHistory({ account, liveAt }) {
   );
 }
 
-function ConfigPanel({ config, onSave, busy }) {
+function ConfigPanel({ config, onSave, busy, catalog }) {
   const [c, setC] = useState(config);
   useEffect(() => setC(config), [config]);
   const field = (key, label, hint) => (
@@ -206,6 +206,42 @@ function ConfigPanel({ config, onSave, busy }) {
       <summary className="flex items-center gap-1.5 text-xs font-mono text-slate-400 cursor-pointer">
         <Settings size={12} /> Parámetros de la estrategia
       </summary>
+      <div className="mt-3">
+        <span className="text-[10px] text-slate-500 uppercase">Activos que opera</span>
+        <div className="mt-1.5 space-y-1.5">
+          {(catalog || []).map((s) => {
+            const on = (c.symbols || []).includes(s.symbol);
+            return (
+              <label key={s.symbol} className="flex items-start gap-2 cursor-pointer">
+                <input
+                  type="checkbox" checked={on}
+                  onChange={(e) => setC({
+                    ...c,
+                    symbols: e.target.checked
+                      ? [...(c.symbols || []), s.symbol]
+                      : (c.symbols || []).filter((x) => x !== s.symbol),
+                  })}
+                  className="mt-0.5 accent-sky-500 shrink-0"
+                />
+                <span className="min-w-0">
+                  <span className="font-mono text-[11px] text-slate-200">{s.label}</span>
+                  <span className={`ml-2 text-[9px] font-mono px-1.5 py-0.5 rounded border ${
+                    s.validated
+                      ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
+                      : "border-amber-500/40 bg-amber-500/10 text-amber-300"}`}>
+                    {s.validated ? "VALIDADO" : "NO VALIDADO"}
+                  </span>
+                  <span className="block text-[10px] text-slate-500 leading-snug mt-0.5">{s.note}</span>
+                </span>
+              </label>
+            );
+          })}
+        </div>
+        {(c.symbols || []).length === 0 && (
+          <p className="mt-1.5 text-[10px] text-amber-300">Sin activos seleccionados se restauran BTC y ETH al guardar.</p>
+        )}
+      </div>
+
       <div className="mt-3 grid grid-cols-2 sm:grid-cols-3 gap-2">
         {field("maPeriod", "Media (días)", "50 fue la que mejor superó la prueba de 7 años")}
         {field("allocationPct", "Capital asignado %", "% del capital repartido entre los símbolos")}
@@ -456,7 +492,7 @@ export default function TradingBot() {
         )}
       </div>
 
-      <ConfigPanel config={config} busy={busy} onSave={(c) => act({ action: "config", config: c })} />
+      <ConfigPanel config={config} busy={busy} catalog={state.catalog} onSave={(c) => act({ action: "config", config: c })} />
 
       <p className="text-[10px] text-slate-600 leading-relaxed">
         Estrategia de asignación de tendencia: mientras el cierre diario supere su media de {config.maPeriod} días

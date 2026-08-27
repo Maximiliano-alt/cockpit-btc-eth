@@ -8,6 +8,29 @@ const store = () => getStore({ name: "bot", consistency: "strong" });
 // está dentro mientras el cierre diario supere su media, y en efectivo si no.
 // No hay cortos ni apalancamiento: ambos empeoraron el resultado en las
 // pruebas sobre 7 años.
+// Catálogo de activos operables, con el resultado de la Compuerta 0 de cada
+// uno (tools/trend.mjs, MA50, 60/40 entrenamiento/verificación). Se guarda
+// aquí para que la UI pueda mostrar la evidencia junto a la casilla y la
+// elección sea informada, no a ciegas.
+export const SYMBOL_CATALOG = [
+  {
+    symbol: "BTCUSDT", label: "BTC", validated: true,
+    note: "Supera la prueba: +73%/a entrenamiento · +40%/a verificación.",
+  },
+  {
+    symbol: "ETHUSDT", label: "ETH", validated: true,
+    note: "Supera la prueba: +96%/a entrenamiento · +26%/a verificación.",
+  },
+  {
+    symbol: "SOLUSDT", label: "SOL", validated: false,
+    note: "NO supera la prueba: +234%/a entrenamiento pero −26%/a en verificación, "
+      + "peor que comprar y mantener (−22%) en la misma ventana donde BTC dio +40% y ETH +26%. "
+      + "Sobre el histórico completo sale +73%/a, pero eso viene de su subida de 2020-21 (de $2 a $250).",
+  },
+];
+
+const ALLOWED = SYMBOL_CATALOG.map((s) => s.symbol);
+
 export const DEFAULT_CONFIG = {
   armed: false,            // interruptor principal: sin esto el bot solo simula
   mode: "demo",            // "demo" = cuenta demo. "live" exige además BOT_ALLOW_LIVE
@@ -48,6 +71,11 @@ export async function setConfig(patch) {
   // 0 desactiva el trailing. Por debajo de 10% recorta ganadores en tendencia,
   // así que ese es el mínimo permitido si está activo.
   next.trailPct = Number(next.trailPct) > 0 ? Math.min(50, Math.max(10, Number(next.trailPct))) : 0;
+  // Solo símbolos del catálogo, y nunca la lista vacía (dejaría al bot sin
+  // nada que hacer sin avisar).
+  const syms = (Array.isArray(next.symbols) ? next.symbols : [])
+    .filter((s) => ALLOWED.includes(s));
+  next.symbols = syms.length ? [...new Set(syms)] : [...DEFAULT_CONFIG.symbols];
   next.dailyLossLimitPct = Math.min(50, Math.max(1, Number(next.dailyLossLimitPct) || 5));
   await store().setJSON("config", next);
   return next;

@@ -7,7 +7,7 @@
 // dueño de la cuenta. El botón de pánico (disarm/close-all) siempre funciona,
 // incluso si el resto está mal configurado.
 import { BinanceFutures } from "./_lib/broker.mjs";
-import { getConfig, setConfig, getLog, getRuntime } from "./_lib/botstate.mjs";
+import { getConfig, setConfig, getLog, getRuntime, SYMBOL_CATALOG } from "./_lib/botstate.mjs";
 import { runTrendCycle, trendSignal } from "./_lib/trendengine.mjs";
 
 function creds(config) {
@@ -134,6 +134,7 @@ export default async (req) => {
     return Response.json({
       config,
       account,
+      catalog: SYMBOL_CATALOG,
       signals: sig,
       log: log.slice(0, 12),
       runtime,
