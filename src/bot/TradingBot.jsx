@@ -70,6 +70,11 @@ function TradeHistory({ account, liveAt }) {
     ["closed", `Cerradas (${h?.count ?? 0})`],
   ];
 
+  // El latente se toma del latido en vivo; si aún no llegó, se suma de las
+  // posiciones que ya tenemos para no mostrar un hueco.
+  const unreal = account.unrealized ?? open.reduce((s, p) => s + (p.pnl || 0), 0);
+  const total = (h?.net ?? 0) + unreal;
+
   return (
     <div className="rounded-lg border border-slate-700/60 bg-slate-950/40 p-3">
       <div className="flex flex-wrap items-center gap-2 mb-3">
@@ -92,29 +97,41 @@ function TradeHistory({ account, liveAt }) {
         </div>
       </div>
 
-      {/* Acumulado: siempre visible, es el número que de verdad importa. */}
+      {/* Resultado total EN VIVO: lo ya cerrado (con comisiones y funding)
+          más lo latente de las posiciones abiertas. Es el número que dice
+          cuánto llevas de verdad ahora mismo. */}
       {h && (
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-3 pb-3 border-b border-slate-700/60">
           <div>
-            <div className="text-[9px] uppercase tracking-wider text-slate-500">P&L neto ({h.days}d)</div>
-            <div className={`font-mono text-base font-bold ${h.net >= 0 ? "text-emerald-300" : "text-rose-300"}`}>
-              {usd(h.net)}
+            <div className="text-[9px] uppercase tracking-wider text-slate-500">
+              P&L neto total {liveAt && <span className="text-emerald-500">· vivo</span>}
+            </div>
+            <div className={`font-mono text-lg font-bold ${total >= 0 ? "text-emerald-300" : "text-rose-300"}`}>
+              {usd(total)}
+            </div>
+            <div className="text-[9px] text-slate-600">cerrado + abierto</div>
+          </div>
+          <div>
+            <div className="text-[9px] uppercase tracking-wider text-slate-500">Abierto (latente)</div>
+            <div className={`font-mono text-sm font-bold ${unreal >= 0 ? "text-emerald-400" : "text-rose-400"}`}>{usd(unreal)}</div>
+            <div className="text-[9px] text-slate-600">
+              {open.length} posición{open.length === 1 ? "" : "es"}
+              {account.notionalUsed ? ` · $${account.notionalUsed.toFixed(0)} en mercado` : ""}
             </div>
           </div>
           <div>
-            <div className="text-[9px] uppercase tracking-wider text-slate-500">Realizado</div>
-            <div className={`font-mono text-sm ${h.realized >= 0 ? "text-emerald-400" : "text-rose-400"}`}>{usd(h.realized)}</div>
-            <div className="text-[9px] text-slate-600">comis. {usd(h.fees)} · fund. {usd(h.funding)}</div>
+            <div className="text-[9px] uppercase tracking-wider text-slate-500">Cerrado ({h.days}d)</div>
+            <div className={`font-mono text-sm ${h.net >= 0 ? "text-emerald-400" : "text-rose-400"}`}>{usd(h.net)}</div>
+            <div className="text-[9px] text-slate-600">
+              realiz. {usd(h.realized)} · comis. {usd(h.fees)} · fund. {usd(h.funding)}
+            </div>
           </div>
           <div>
             <div className="text-[9px] uppercase tracking-wider text-slate-500">Aciertos</div>
             <div className="font-mono text-sm text-slate-200">{h.count ? `${h.winRate.toFixed(0)}%` : "—"}</div>
-            <div className="text-[9px] text-slate-600">{h.count} cierres</div>
-          </div>
-          <div>
-            <div className="text-[9px] uppercase tracking-wider text-slate-500">Mejor / peor</div>
-            <div className="font-mono text-[11px] text-emerald-400">{h.count ? usd(h.bestPnl) : "—"}</div>
-            <div className="font-mono text-[11px] text-rose-400">{h.count ? usd(h.worstPnl) : "—"}</div>
+            <div className="text-[9px] text-slate-600">
+              {h.count} cierres{h.count ? ` · mejor ${usd(h.bestPnl)} / peor ${usd(h.worstPnl)}` : ""}
+            </div>
           </div>
         </div>
       )}
@@ -292,7 +309,11 @@ export default function TradingBot() {
         setState((prev) => prev?.config ? {
           ...prev,
           liveAt: j.at,
-          account: { ...prev.account, equity: j.equity, available: j.available, positions: j.positions },
+          account: {
+            ...prev.account,
+            equity: j.equity, available: j.available, positions: j.positions,
+            unrealized: j.unrealized, notionalUsed: j.notionalUsed,
+          },
         } : prev);
       } catch { /* un latido perdido no rompe nada */ }
     };

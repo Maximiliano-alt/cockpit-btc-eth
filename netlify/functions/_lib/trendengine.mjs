@@ -15,6 +15,10 @@ import { BinanceFutures, roundStep } from "./broker.mjs";
 import { fetchCandles } from "../../../src/data/candles.js";
 import { getConfig, setConfig, getRuntime, setRuntime, appendLog, todayKey } from "./botstate.mjs";
 
+// Colchón sobre el margen libre: comisiones y el deslizamiento entre el
+// precio que se consulta y el de ejecución pueden dejar la orden justa.
+const MARGIN_BUFFER = 0.97;
+
 /** Media simple de los últimos `n` cierres. */
 function sma(values, n) {
   if (values.length < n) return null;
@@ -161,6 +165,12 @@ export async function runTrendCycle({ manual = false } = {}) {
   // Sin apalancamiento: la suma de notional nunca supera el capital.
   const perSymbol = (account.equity * (config.allocationPct / 100)) / config.symbols.length;
 
+  // Margen realmente disponible, que se va descontando con cada entrada de
+  // este mismo ciclo (account.available es una foto del inicio).
+  let availableLeft = account.available;
+  summary.perSymbolTarget = perSymbol;
+  summary.availableAtStart = account.available;
+
   for (const s of signals) {
     const amt = held[s.symbol] || 0;
     const f = info[s.symbol];
@@ -218,15 +228,36 @@ export async function runTrendCycle({ manual = false } = {}) {
     if (s.target === 1 && !inPosition) {
       try {
         const price = await broker.price(s.symbol);
-        const qty = roundStep(perSymbol / price, f.stepSize);
-        if (qty <= 0 || qty * price < f.minNotional) {
-          decisions.push({ symbol: s.symbol, action: "skip", reason: `capital insuficiente: ${(perSymbol).toFixed(0)} USDT no alcanza el mínimo de ${f.minNotional}` });
+
+        // El reparto teórico sale del capital TOTAL, pero lo que de verdad se
+        // puede comprometer es el margen libre: si ya hay posiciones abiertas
+        // (por ejemplo al añadir un activo nuevo), el resto del capital ya
+        // está en uso. Sin este tope, Binance rechazaba la orden con un
+        // "Margin is insufficient" que no explicaba nada.
+        const usable = Math.min(perSymbol, availableLeft * MARGIN_BUFFER);
+        const qty = roundStep(usable / price, f.stepSize);
+        const notional = qty * price;
+
+        if (qty <= 0 || notional < f.minNotional) {
+          decisions.push({
+            symbol: s.symbol, action: "skip",
+            reason: perSymbol > availableLeft
+              ? `margen insuficiente: le tocarían $${perSymbol.toFixed(0)} pero solo quedan $${availableLeft.toFixed(0)} libres — el resto del capital ya está en las posiciones abiertas. Se abrirá cuando alguna salga.`
+              : `$${usable.toFixed(0)} no alcanza el mínimo de $${f.minNotional} que exige el broker`,
+          });
           continue;
         }
+
         await broker.setLeverage(s.symbol, 1);
         const r = await broker.marketOrder({ symbol: s.symbol, side: "BUY", quantity: qty });
+        availableLeft -= notional;
         trail[s.symbol] = { peak: price };
-        decisions.push({ symbol: s.symbol, action: "enter", qty, price, orderId: r.orderId, reason: s.reason });
+        decisions.push({
+          symbol: s.symbol, action: "enter", qty, price, orderId: r.orderId,
+          reason: notional < perSymbol * 0.95
+            ? `${s.reason} · tamaño reducido a $${notional.toFixed(0)} por margen disponible`
+            : s.reason,
+        });
       } catch (e) {
         decisions.push({ symbol: s.symbol, action: "error", reason: String(e.message || e).slice(0, 120) });
       }

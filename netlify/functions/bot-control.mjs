@@ -107,19 +107,23 @@ export default async (req) => {
       const a = await broker.account();
       const marks = {};
       await Promise.allSettled(a.positions.map(async (p) => { marks[p.symbol] = await broker.price(p.symbol); }));
+      const positions = a.positions.map((p) => {
+        const mark = marks[p.symbol] ?? null;
+        return {
+          ...p, mark,
+          notional: mark ? Math.abs(p.amt) * mark : null,
+          pnlPct: p.entry > 0 && mark ? ((mark - p.entry) / p.entry) * 100 * Math.sign(p.amt) : null,
+        };
+      });
       return Response.json({
         connected: true,
         at: Date.now(),
         equity: a.equity,
         available: a.available,
-        positions: a.positions.map((p) => {
-          const mark = marks[p.symbol] ?? null;
-          return {
-            ...p, mark,
-            notional: mark ? Math.abs(p.amt) * mark : null,
-            pnlPct: p.entry > 0 && mark ? ((mark - p.entry) / p.entry) * 100 * Math.sign(p.amt) : null,
-          };
-        }),
+        // Suma latente de todo lo abierto: es la mitad viva del resultado.
+        unrealized: positions.reduce((s, p) => s + (p.pnl || 0), 0),
+        notionalUsed: positions.reduce((s, p) => s + (p.notional || 0), 0),
+        positions,
       });
     } catch (e) {
       return Response.json({ connected: false, reason: String(e.message || e).slice(0, 140) });
