@@ -1543,11 +1543,11 @@ export default function Cockpit() {
           btcCfg={mergedAssets.BTCUSDT}
         />
 
-        <TradingBot />
-
         <Diagnosis btc={btc} fg={fg} etf={etf} onchain={onchain} ai={ai} cfg={mergedAssets.BTCUSDT} zonesLoading={zonesLoading} />
 
         <Playbook data={aiZones?.playbook} aiModel={aiZones?.model} loading={zonesLoading} />
+
+        <TradingBot />
 
         {/* fuentes */}
         <section className="rounded-xl border border-slate-700/60 bg-slate-900/60 p-4">

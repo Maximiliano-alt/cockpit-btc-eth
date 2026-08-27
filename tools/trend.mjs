@@ -65,9 +65,13 @@ const sma = (v, i, n) => {
  * ejecuta a la APERTURA del día siguiente — la señal usa el cierre de hoy,
  * que ya ocurrió, así que no hay lookahead.
  */
-function allocate(candles, signalFn, from, to, allowShort = false) {
+function allocate(candles, signalFn, from, to, allowShort = false, opts = {}) {
+  const { trailPct = 0, fundingAnnualPct = 0 } = opts;
   const closes = candles.map((c) => c.c);
   let equity = 1, pos = 0, peak = 1, maxDD = 0, switches = 0;
+  let entryPeak = 0;        // máximo alcanzado desde que se entró
+  let lockedOut = false;    // tras saltar el trailing, no reentrar hasta reset
+  let trailExits = 0;
   const daysHeld = { long: 0, flat: 0, short: 0 };
 
   for (let i = from; i < to; i++) {
@@ -75,15 +79,37 @@ function allocate(candles, signalFn, from, to, allowShort = false) {
     const ret = candles[i + 1].c / candles[i + 1].o - 1
       + (candles[i + 1].o / candles[i].c - 1);
     equity *= 1 + pos * ret;
+    // Coste de financiación: solo se paga mientras se está en posición.
+    if (pos !== 0 && fundingAnnualPct) equity *= 1 - (fundingAnnualPct / 100) / 365;
     peak = Math.max(peak, equity);
     maxDD = Math.max(maxDD, (peak - equity) / peak);
     daysHeld[pos > 0 ? "long" : pos < 0 ? "short" : "flat"]++;
 
     let want = signalFn(closes, candles, i);
     if (!allowShort && want < 0) want = 0;
+
+    if (trailPct > 0) {
+      if (pos > 0) {
+        entryPeak = Math.max(entryPeak, closes[i]);
+        // Salida por trailing: caída desde el máximo alcanzado en la posición.
+        if (closes[i] <= entryPeak * (1 - trailPct / 100)) {
+          want = 0;
+          lockedOut = true;
+          trailExits++;
+        }
+      }
+      // El bloqueo se levanta solo cuando la señal base se apaga; si no,
+      // volveríamos a entrar al día siguiente y el trailing no serviría.
+      if (lockedOut) {
+        if (signalFn(closes, candles, i) === 0) lockedOut = false;
+        else want = 0;
+      }
+    }
+
     if (want !== pos) {
       equity *= 1 - COST * Math.abs(want - pos);
       switches++;
+      if (want > 0) entryPeak = closes[i];
       pos = want;
     }
   }
@@ -91,7 +117,7 @@ function allocate(candles, signalFn, from, to, allowShort = false) {
   const total = (equity - 1) * 100;
   return {
     total, annual: (Math.pow(equity, 365 / days) - 1) * 100,
-    maxDD: maxDD * 100, switches,
+    maxDD: maxDD * 100, switches, trailExits,
     exposure: (daysHeld.long + daysHeld.short) / (days || 1) * 100,
   };
 }

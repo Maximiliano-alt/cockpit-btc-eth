@@ -58,7 +58,7 @@ function Row({ label, children }) {
  * y cierres realizados con el acumulado neto (P&L menos comisiones y funding,
  * que es lo que de verdad queda en la cuenta).
  */
-function TradeHistory({ account }) {
+function TradeHistory({ account, liveAt }) {
   const [tab, setTab] = useState("open");
   const h = account.history;
   const open = account.positions || [];
@@ -74,6 +74,12 @@ function TradeHistory({ account }) {
     <div className="rounded-lg border border-slate-700/60 bg-slate-950/40 p-3">
       <div className="flex flex-wrap items-center gap-2 mb-3">
         <h3 className="text-[10px] font-mono uppercase tracking-wider text-slate-400">Operaciones</h3>
+        {liveAt && (
+          <span className="inline-flex items-center gap-1 text-[9px] font-mono text-emerald-400">
+            <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" />
+            en vivo · {new Date(liveAt).toLocaleTimeString()}
+          </span>
+        )}
         <div className="flex gap-1 ml-auto">
           {tabs.map(([k, label]) => (
             <button
@@ -203,6 +209,7 @@ function ConfigPanel({ config, onSave, busy }) {
       <div className="mt-3 grid grid-cols-2 sm:grid-cols-3 gap-2">
         {field("maPeriod", "Media (días)", "50 fue la que mejor superó la prueba de 7 años")}
         {field("allocationPct", "Capital asignado %", "% del capital repartido entre los símbolos")}
+        {field("trailPct", "Trailing stop %", "0 lo desactiva · mide la caída desde el máximo de la posición")}
         {field("dailyLossLimitPct", "Límite pérdida diaria %")}
       </div>
       <p className="mt-3 text-[10px] text-slate-500 leading-relaxed">
@@ -233,6 +240,28 @@ export default function TradingBot() {
       setState(s);
       setErr(null);
     } catch (e) { setErr(String(e.message || e)); }
+  }, []);
+
+  // Latido en vivo: refresca capital, posiciones y P&L cada 8 s con la
+  // consulta ligera, sin recargar el historial completo (que es lento y no
+  // cambia entre latidos).
+  useEffect(() => {
+    let alive = true;
+    const beat = async () => {
+      try {
+        const res = await fetch("/.netlify/functions/bot-control?live=1");
+        const t = await res.text();
+        const j = JSON.parse(t);
+        if (!alive || !j?.connected) return;
+        setState((prev) => prev?.config ? {
+          ...prev,
+          liveAt: j.at,
+          account: { ...prev.account, equity: j.equity, available: j.available, positions: j.positions },
+        } : prev);
+      } catch { /* un latido perdido no rompe nada */ }
+    };
+    const t = setInterval(beat, 8000);
+    return () => { alive = false; clearInterval(t); };
   }, []);
 
   useEffect(() => {
@@ -330,6 +359,7 @@ export default function TradingBot() {
           <div className="space-y-1">
             <Row label="Señal">MA {config.maPeriod} diaria</Row>
             <Row label="Posición">Largo / efectivo</Row>
+            <Row label="Trailing">{config.trailPct > 0 ? `${config.trailPct}%` : "desactivado"}</Row>
             <Row label="Apalancamiento">1× (ninguno)</Row>
             <Row label="Corte diario">−{config.dailyLossLimitPct}%</Row>
           </div>
@@ -397,7 +427,7 @@ export default function TradingBot() {
       )}
 
       {account.connected && (
-        <TradeHistory account={account} />
+        <TradeHistory account={account} liveAt={state.liveAt} />
       )}
 
       <div className="rounded-lg border border-slate-700/60 bg-slate-950/40 p-3">

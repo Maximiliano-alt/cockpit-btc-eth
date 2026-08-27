@@ -96,6 +96,36 @@ export default async (req) => {
     return Response.json({ reachability: await reachability(), region: process.env.AWS_REGION || null });
   }
 
+  // Modo ligero para refrescar el P&L en vivo cada pocos segundos: solo cuenta
+  // y precios. Se omiten el historial de ingresos y las órdenes pendientes,
+  // que son lentos y no cambian entre latidos.
+  if (req.method === "GET" && new URL(req.url).searchParams.get("live") === "1") {
+    const c = creds(config);
+    if (!c.apiKey || !c.apiSecret) return Response.json({ connected: false });
+    try {
+      const broker = new BinanceFutures({ mode: config.mode, ...c });
+      const a = await broker.account();
+      const marks = {};
+      await Promise.allSettled(a.positions.map(async (p) => { marks[p.symbol] = await broker.price(p.symbol); }));
+      return Response.json({
+        connected: true,
+        at: Date.now(),
+        equity: a.equity,
+        available: a.available,
+        positions: a.positions.map((p) => {
+          const mark = marks[p.symbol] ?? null;
+          return {
+            ...p, mark,
+            notional: mark ? Math.abs(p.amt) * mark : null,
+            pnlPct: p.entry > 0 && mark ? ((mark - p.entry) / p.entry) * 100 * Math.sign(p.amt) : null,
+          };
+        }),
+      });
+    } catch (e) {
+      return Response.json({ connected: false, reason: String(e.message || e).slice(0, 140) });
+    }
+  }
+
   if (req.method === "GET") {
     const [account, log, runtime, ...sig] = await Promise.all([
       accountSnapshot(config), getLog(), getRuntime(),

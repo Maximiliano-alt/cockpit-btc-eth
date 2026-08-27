@@ -27,6 +27,20 @@ function sma(values, n) {
  * Señal de exposición para un símbolo: 1 = dentro, 0 = efectivo.
  * Usa SOLO velas diarias ya cerradas, así que no depende de la vela en curso.
  */
+/**
+ * Trailing stop como red de seguridad, no como generador de rentabilidad.
+ * Medido sobre 7 años: con 20% el peor tramo pasa de 26,0% a 28,3% anual y la
+ * caída máxima apenas se mueve (59%), porque la salida por MA50 casi siempre
+ * salta antes. Su valor real es cubrir un desplome más rápido de lo que la
+ * media puede reaccionar. Con 10% recorta la caída al 54% pero destroza la
+ * rentabilidad en tendencia (BTC de +73% a +27% anual), así que no se usa.
+ */
+export function trailingCheck({ peak, price, trailPct }) {
+  if (!peak || !trailPct) return { hit: false, peak: Math.max(peak || 0, price) };
+  const newPeak = Math.max(peak, price);
+  return { hit: price <= newPeak * (1 - trailPct / 100), peak: newPeak, drawdownPct: ((price - newPeak) / newPeak) * 100 };
+}
+
 export async function trendSignal(symbol, maPeriod) {
   const candles = await fetchCandles(symbol, "1d", Math.max(maPeriod + 60, 200));
   if (candles.length < maPeriod + 2) {
@@ -138,6 +152,11 @@ export async function runTrendCycle({ manual = false } = {}) {
   const info = await broker.symbolInfo();
   const held = Object.fromEntries(account.positions.map((p) => [p.symbol, p.amt]));
 
+  // Estado del trailing por símbolo: máximo alcanzado desde la entrada y si
+  // el trailing ya saltó (en ese caso no se reentra hasta que la señal base
+  // se apague, para no volver a comprar al día siguiente).
+  const trail = { ...(rt.trail || {}) };
+
   // Capital por símbolo: se reparte el capital entre los activos configurados.
   // Sin apalancamiento: la suma de notional nunca supera el capital.
   const perSymbol = (account.equity * (config.allocationPct / 100)) / config.symbols.length;
@@ -161,6 +180,41 @@ export async function runTrendCycle({ manual = false } = {}) {
     }
 
     const inPosition = amt > 0;
+    const st = trail[s.symbol] || {};
+
+    // Si la señal base se apagó, se levanta cualquier bloqueo de trailing.
+    if (s.target === 0 && st.lockedOut) { trail[s.symbol] = {}; }
+
+    // Trailing: se evalúa con el precio en vivo, no con el cierre diario,
+    // que es justo el caso que la MA no cubre (desplome intradía).
+    if (inPosition && config.trailPct > 0) {
+      let price;
+      try { price = await broker.price(s.symbol); } catch { price = null; }
+      if (price) {
+        const t = trailingCheck({ peak: st.peak || price, price, trailPct: config.trailPct });
+        if (t.hit) {
+          try {
+            await broker.closePosition(s.symbol, amt);
+            trail[s.symbol] = { lockedOut: true };
+            decisions.push({
+              symbol: s.symbol, action: "trail-exit", qty: amt, price,
+              reason: `trailing ${config.trailPct}%: ${price.toFixed(0)} cayó ${Math.abs(t.drawdownPct).toFixed(1)}% desde el máximo ${t.peak.toFixed(0)} de esta posición`,
+            });
+          } catch (e) {
+            decisions.push({ symbol: s.symbol, action: "error", reason: String(e.message || e).slice(0, 120) });
+          }
+          continue;
+        }
+        trail[s.symbol] = { ...st, peak: t.peak };
+      }
+    }
+
+    // Bloqueado tras un trailing: no reentrar mientras la señal siga encendida.
+    if (!inPosition && st.lockedOut && s.target === 1) {
+      decisions.push({ symbol: s.symbol, action: "stay-out", reason: `bloqueado tras salida por trailing — se reentra cuando la señal se apague y vuelva a encenderse` });
+      continue;
+    }
+
     if (s.target === 1 && !inPosition) {
       try {
         const price = await broker.price(s.symbol);
@@ -171,6 +225,7 @@ export async function runTrendCycle({ manual = false } = {}) {
         }
         await broker.setLeverage(s.symbol, 1);
         const r = await broker.marketOrder({ symbol: s.symbol, side: "BUY", quantity: qty });
+        trail[s.symbol] = { peak: price };
         decisions.push({ symbol: s.symbol, action: "enter", qty, price, orderId: r.orderId, reason: s.reason });
       } catch (e) {
         decisions.push({ symbol: s.symbol, action: "error", reason: String(e.message || e).slice(0, 120) });
@@ -178,6 +233,7 @@ export async function runTrendCycle({ manual = false } = {}) {
     } else if (s.target === 0 && inPosition) {
       try {
         await broker.closePosition(s.symbol, amt);
+        trail[s.symbol] = {};
         decisions.push({ symbol: s.symbol, action: "exit", qty: amt, reason: s.reason });
       } catch (e) {
         decisions.push({ symbol: s.symbol, action: "error", reason: String(e.message || e).slice(0, 120) });
@@ -191,6 +247,7 @@ export async function runTrendCycle({ manual = false } = {}) {
     }
   }
 
+  await setRuntime({ trail });
   await appendLog({ type: "cycle", ...summary });
   return summary;
 }

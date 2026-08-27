@@ -15,6 +15,7 @@ export const DEFAULT_CONFIG = {
   symbols: ["BTCUSDT", "ETHUSDT"],
   maPeriod: 50,            // media de referencia (50 fue la mejor en la prueba)
   allocationPct: 90,       // % del capital que se reparte entre los símbolos
+  trailPct: 20,            // red de seguridad ante desplomes más rápidos que la MA
   dailyLossLimitPct: 5,    // pérdida diaria que desarma el bot y cierra todo
 };
 
@@ -44,6 +45,9 @@ export async function setConfig(patch) {
   next.strategy = "trend";
   next.maPeriod = Math.min(200, Math.max(10, Math.round(Number(next.maPeriod) || 50)));
   next.allocationPct = Math.min(100, Math.max(10, Number(next.allocationPct) || 90));
+  // 0 desactiva el trailing. Por debajo de 10% recorta ganadores en tendencia,
+  // así que ese es el mínimo permitido si está activo.
+  next.trailPct = Number(next.trailPct) > 0 ? Math.min(50, Math.max(10, Number(next.trailPct))) : 0;
   next.dailyLossLimitPct = Math.min(50, Math.max(1, Number(next.dailyLossLimitPct) || 5));
   await store().setJSON("config", next);
   return next;
