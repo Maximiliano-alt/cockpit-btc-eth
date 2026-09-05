@@ -11,7 +11,7 @@ import { getStore } from "@netlify/blobs";
 // `signature`: si cambia, el cache se considera vencido aunque no haya
 // expirado el TTL. Sirve para regenerar cuando cambian los datos de entrada
 // (p. ej. se publicó el resultado de un evento nuevo) sin bajar el TTL.
-export async function withAiCache({ key, ttlMs, cooldownMs = 10 * 60 * 1000, force = false, signature = null, generate }) {
+export async function withAiCache({ key, ttlMs, cooldownMs = 10 * 60 * 1000, force = false, signature = null, skipWrite = false, generate }) {
   // strong: una escritura recién hecha (p.ej. regeneración de otra pestaña)
   // se ve de inmediato; con la consistencia eventual por defecto la lectura
   // podía devolver la versión vieja durante ~1 min.
@@ -34,8 +34,10 @@ export async function withAiCache({ key, ttlMs, cooldownMs = 10 * 60 * 1000, for
 
   try {
     const data = await generate();
-    await store.setJSON(key, { at: now, signature, data });
-    return { data, served: "generated" };
+    // skipWrite: el resultado se sirve pero no se persiste (p. ej. se generó
+    // con datos incompletos y no debe quedar fijado durante todo el TTL).
+    if (!skipWrite) await store.setJSON(key, { at: now, signature, data });
+    return { data, served: skipWrite ? "generated-sin-cachear" : "generated" };
   } catch (e) {
     try { await store.setJSON(key, { ...(entry || { at: 0 }), lastFailAt: now }); } catch { /* best effort */ }
     if (entry?.data) {

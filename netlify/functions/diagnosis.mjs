@@ -4,6 +4,37 @@
 // para vivir dentro de la cuota gratuita de Gemini (~20 req/día por modelo).
 import { callGeminiWithFallback } from "./_lib/gemini.mjs";
 import { withAiCache } from "./_lib/aicache.mjs";
+import { getStore } from "@netlify/blobs";
+
+/**
+ * Las zonas son autoritativas del SERVIDOR, no del cliente.
+ *
+ * El navegador enviaba su instantánea de contexto 1,2 s después de cargar,
+ * cuando las zonas (que tardan segundos en calcularse) todavía valían null.
+ * El diagnóstico salía diciendo "Zonas IA: datos no disponibles" aunque los
+ * gráficos las mostraran, y encima quedaba cacheado 45 min. Leyéndolas aquí
+ * del mismo blob que las guardó, el fallo de sincronización desaparece.
+ */
+async function serverZones() {
+  try {
+    const store = getStore({ name: "ai-cache", consistency: "strong" });
+    const z = await store.get("zones", { type: "json" });
+    return z?.data?.zones || null;
+  } catch { return null; }
+}
+
+// Bloques que hacen falta para que el diagnóstico valga algo. Si faltan, el
+// resultado se genera igual pero NO se cachea: así una carga incompleta no
+// envenena la respuesta durante los siguientes 45 minutos.
+function contextGaps(ctx) {
+  const gaps = [];
+  if (!ctx.zonasIA || !Object.keys(ctx.zonasIA).length) gaps.push("zonasIA");
+  if (!ctx.fearGreed) gaps.push("fearGreed");
+  if (!ctx.onchain) gaps.push("onchain");
+  if (!ctx.macro?.dxy && !ctx.macro?.sp500) gaps.push("macro");
+  if (!ctx.sesgoPorTemporalidad) gaps.push("sesgoPorTemporalidad");
+  return gaps;
+}
 
 const TTL = 45 * 60 * 1000;
 
@@ -55,13 +86,26 @@ export default async (req) => {
   }
   const bodyText = await req.text();
   const force = new URL(req.url).searchParams.get("force") === "1";
+
+  // Se completa el contexto del cliente con lo que el servidor ya tiene.
+  let ctx = {};
+  try { ctx = JSON.parse(bodyText || "{}"); } catch { /* contexto vacío */ }
+  if (!ctx.zonasIA || !Object.keys(ctx.zonasIA).length) {
+    const z = await serverZones();
+    if (z) ctx.zonasIA = z;
+  }
+  const gaps = contextGaps(ctx);
+
   try {
     const { data, served } = await withAiCache({
       key: "diagnosis",
       ttlMs: TTL,
       force,
+      // Un diagnóstico hecho con huecos no se guarda: se sirve una vez y el
+      // siguiente cliente con datos completos genera el bueno.
+      skipWrite: gaps.length > 0,
       generate: async () => {
-        const user = "Contexto en vivo (todas las variables del cockpit):\n" + (bodyText || "{}");
+        const user = "Contexto en vivo (todas las variables del cockpit):\n" + JSON.stringify(ctx);
         let text, model;
         if (gemini) {
           try {
@@ -79,10 +123,10 @@ export default async (req) => {
           model = "claude-sonnet-4-6";
         }
         if (!text) throw new Error("respuesta vacía del modelo");
-        return { text, model, at: Date.now() };
+        return { text, model, at: Date.now(), gaps };
       },
     });
-    return jsonResponse({ ...data, served });
+    return jsonResponse({ ...data, served, gaps });
   } catch (e) {
     return jsonResponse({ error: String(e) }, 500);
   }

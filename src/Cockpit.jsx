@@ -1,12 +1,13 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import {
   Lock, Calendar, ExternalLink, Target, Radio, RefreshCw,
-  Stethoscope, Wifi, WifiOff, MessageCircle
+  Stethoscope, Wifi, WifiOff, MessageCircle, HelpCircle, Sparkles
 } from "lucide-react";
 import RiskPortfolioManager from "./ros/RiskPortfolioManager.jsx";
 import TradingBot from "./bot/TradingBot.jsx";
 import { detectStructure, timeframeBias } from "./ros/structure.js";
 import { fetchCandles, fetchPrices } from "./data/candles.js";
+import { readMetric } from "./data/metricInfo.js";
 
 // ───────────────────────── CONFIG: activos (zonas vienen de IA) ────────────
 const ASSETS = {
@@ -306,6 +307,36 @@ function useBtcStructure(btcCfg) {
   return s;
 }
 
+// Resumen IA que cruza todas las variables en vivo entre sí. Se pide una vez
+// que hay datos suficientes; el servidor lo cachea con firma sobre los valores,
+// así que solo se regenera cuando el cuadro de mercado cambia de verdad.
+function useMarketSummary(vars) {
+  const [sum, setSum] = useState(null);
+  const sent = useRef(false);
+  useEffect(() => {
+    if (sent.current) return;
+    if (vars.fearGreed == null || vars.puell == null) return;
+    sent.current = true;
+    // Ojo: este efecto depende de `vars`, que cambia de identidad cada vez
+    // que llega un dato nuevo. Con el patrón habitual de `let live = true` +
+    // cleanup, la re-ejecución del efecto marcaba live=false y la respuesta
+    // en vuelo se descartaba, así que el resumen no se pintaba nunca.
+    // Como solo se envía una vez, no hace falta cancelar nada.
+    (async () => {
+      try {
+        const res = await fetch("/.netlify/functions/market-summary", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(vars),
+        });
+        const j = await res.json();
+        if (j?.text) setSum(j);
+      } catch { /* sin resumen */ }
+    })();
+  }, [vars]);
+  return sum;
+}
+
 // Señal social / de atención (CoinGecko + Reddit vía function, cache 20 min).
 function useSocial() {
   const [social, setSocial] = useState(null);
@@ -373,11 +404,23 @@ function useAiDiagnosis(online, ctxRef) {
         if (live && j?.text) { setAi(j); setAiError(null); }
       } catch { /* siguiente intento del intervalo */ }
     };
-    // Pequeña espera para que el contexto (precios, F&G) se llene antes del
-    // primer POST; el servidor responde desde cache igual, así que es rápido.
-    const first = setTimeout(load, 1200);
+    // Se espera a que el contexto esté COMPLETO antes de preguntar. Con la
+    // espera fija de 1,2 s de antes, el POST salía cuando las zonas y varias
+    // métricas aún valían null: la IA respondía "datos no disponibles" y esa
+    // respuesta pobre quedaba cacheada 45 min. Ahora se sondea cada segundo
+    // hasta que llegan los bloques clave, con un tope por si alguna fuente
+    // nunca responde (mejor un diagnóstico incompleto que ninguno).
+    let waited = 0;
+    const ready = () => {
+      const c = ctxRef.current || {};
+      return c.zonasIA && c.fearGreed && c.onchain && c.sesgoPorTemporalidad;
+    };
+    const poll = setInterval(() => {
+      waited += 1000;
+      if (ready() || waited >= 45000) { clearInterval(poll); load(); }
+    }, 1000);
     const t = setInterval(load, 10 * 60 * 1000);
-    return () => { live = false; clearTimeout(first); clearInterval(t); };
+    return () => { live = false; clearInterval(poll); clearInterval(t); };
   }, [online, ctxRef]);
   return ai || (aiError ? { error: aiError } : null);
 }
@@ -413,9 +456,21 @@ function useAiZones(online, ctxRef) {
       } catch { /* sin zonas */ }
       finally { if (live) setLoading(false); }
     };
-    const first = setTimeout(load, 400);
+    // Mismo problema que el diagnóstico: a los 400 ms el contexto de mercado
+    // (F&G, on-chain, macro) aún era null, así que las zonas y el playbook se
+    // generaban SOLO con velas, ignorando todo el análisis del cockpit. Se
+    // espera a que llegue, con tope para no bloquear el análisis técnico.
+    let waited = 0;
+    const ready = () => {
+      const c = ctxRef.current || {};
+      return c.fearGreed && c.onchain && c.sesgoPorTemporalidad;
+    };
+    const poll = setInterval(() => {
+      waited += 1000;
+      if (ready() || waited >= 30000) { clearInterval(poll); load(); }
+    }, 1000);
     const t = setInterval(load, 4 * 60 * 60 * 1000);
-    return () => { live = false; clearTimeout(first); clearInterval(t); };
+    return () => { live = false; clearInterval(poll); clearInterval(t); };
   }, [online, ctxRef]);
   return { data: z, loading };
 }
@@ -1317,6 +1372,20 @@ export default function Cockpit() {
   const daily = useBtcDaily();
   const macro = useMacro();
   const social = useSocial();
+  const summaryVars = useMemo(() => ({
+    fearGreed: fg?.value ?? null,
+    btcDom: dom?.btc ?? null, ethDom: dom?.eth ?? null,
+    etfBtc: etf?.btc?.total ?? null, etfEth: etf?.eth?.total ?? null,
+    fundingBtc: derivs?.BTCUSDT?.funding ?? null,
+    openInterestUsd: derivs ? (derivs.BTCUSDT?.oiUsd ?? 0) + (derivs.ETHUSDT?.oiUsd ?? 0) : null,
+    puell: onchain?.puell?.value ?? null, mvrvz: onchain?.mvrvz?.value ?? null,
+    mayer: daily?.mayer ?? null, rsi22: daily?.rsi22 ?? null,
+    cycleTop: onchain?.cycleTop?.hit ?? null, altseason: onchain?.altseason?.value ?? null,
+    dxyChange: macro?.dxy?.changePct ?? null, spChange: macro?.sp500?.changePct ?? null,
+    socialBtc: social?.assets?.BTC?.sentimentUp ?? null,
+    socialEth: social?.assets?.ETH?.sentimentUp ?? null,
+  }), [fg, dom, etf, derivs, onchain, daily, macro, social]);
+  const marketSummary = useMarketSummary(summaryVars);
   const btc = prices.BTCUSDT?.price ?? null;
   const eth = prices.ETHUSDT?.price ?? null;
   const sol = prices.SOLUSDT?.price ?? null;
@@ -1379,13 +1448,32 @@ export default function Cockpit() {
     gatillos4H: triggers ?? null,
   };
 
-  const Live = ({ label, value, sub, tone }) => (
-    <div className={`rounded-md border px-2.5 py-2 ${tone || "border-slate-700 bg-slate-800/40 text-slate-200"}`}>
-      <div className="text-[10px] uppercase tracking-wider opacity-70">{label}</div>
-      <div className="font-mono text-base font-bold">{value}</div>
-      {sub && <div className="text-[10px] opacity-80">{sub}</div>}
-    </div>
-  );
+  // `metric` + `raw`: activan la explicación de qué mide la variable y qué
+  // significa el valor concreto que muestra ahora. Se despliega al tocar, para
+  // no llenar la cuadrícula de texto.
+  const Live = ({ label, value, sub, tone, metric, raw }) => {
+    const [open, setOpen] = useState(false);
+    const info = metric ? readMetric(metric, raw) : null;
+    return (
+      <div
+        className={`rounded-md border px-2.5 py-2 ${tone || "border-slate-700 bg-slate-800/40 text-slate-200"} ${info ? "cursor-pointer" : ""}`}
+        onClick={info ? () => setOpen((o) => !o) : undefined}
+      >
+        <div className="text-[10px] uppercase tracking-wider opacity-70 flex items-center gap-1">
+          {label}
+          {info && <HelpCircle size={9} className="opacity-50 shrink-0" />}
+        </div>
+        <div className="font-mono text-base font-bold">{value}</div>
+        {sub && <div className="text-[10px] opacity-80">{sub}</div>}
+        {open && info && (
+          <div className="mt-2 pt-2 border-t border-current/20 space-y-1 text-[10px] leading-snug font-sans opacity-90">
+            <p><span className="opacity-60">Qué mide · </span>{info.que}</p>
+            {info.lee && <p><span className="opacity-60">Ahora · </span>{info.lee}</p>}
+          </div>
+        )}
+      </div>
+    );
+  };
   const chg = (s) => prices[s] ? `${prices[s].change >= 0 ? "+" : ""}${prices[s].change.toFixed(2)}% 24h` : "";
 
   return (
@@ -1438,24 +1526,24 @@ export default function Cockpit() {
         <section className="rounded-xl border border-slate-700/60 bg-slate-900/60 p-4">
           <div className="flex items-center gap-2 mb-2"><Radio size={15} className="text-emerald-400" /><h2 className="text-sm font-mono tracking-wide text-slate-300">En vivo</h2></div>
           <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-2 mb-4">
-            <Live label="Fear & Greed" value={fg ? String(fg.value) : "16"} sub={fg ? fg.label : "snapshot"} tone={(fg?.value ?? 16) <= 25 ? toneClasses.danger : toneClasses.warn} />
-            <Live label="BTC Dominance" value={dom ? dom.btc.toFixed(1) + "%" : "58.2%"} sub={dom ? "live" : "snapshot"} tone={toneClasses.warn} />
-            <Live label="ETH Dominance" value={dom ? dom.eth.toFixed(1) + "%" : "9.3%"} sub={dom ? "live" : "snapshot"} tone={toneClasses.warn} />
-            <Live label={`ETF BTC${etf?.btc ? " (" + etf.btc.date.slice(0, 6) + ")" : ""}`}
+            <Live metric="fearGreed" raw={fg?.value} label="Fear & Greed" value={fg ? String(fg.value) : "16"} sub={fg ? fg.label : "snapshot"} tone={(fg?.value ?? 16) <= 25 ? toneClasses.danger : toneClasses.warn} />
+            <Live metric="btcDominance" raw={dom?.btc} label="BTC Dominance" value={dom ? dom.btc.toFixed(1) + "%" : "58.2%"} sub={dom ? "live" : "snapshot"} tone={toneClasses.warn} />
+            <Live metric="ethDominance" raw={dom?.eth} label="ETH Dominance" value={dom ? dom.eth.toFixed(1) + "%" : "9.3%"} sub={dom ? "live" : "snapshot"} tone={toneClasses.warn} />
+            <Live metric="etf" raw={etf?.btc?.total} label={`ETF BTC${etf?.btc ? " (" + etf.btc.date.slice(0, 6) + ")" : ""}`}
               value={etf?.btc ? `${etf.btc.total >= 0 ? "+" : "−"}${Math.abs(etf.btc.total).toFixed(1)}M` : "−91.4M"}
               sub={etf?.btc ? (etf.btc.total >= 0 ? "Entrada" : "Salida") : "snapshot"}
               tone={(etf?.btc ? etf.btc.total : -91.4) >= 0 ? toneClasses.good : toneClasses.danger} />
-            <Live label={`ETF ETH${etf?.eth ? " (" + etf.eth.date.slice(0, 6) + ")" : ""}`}
+            <Live metric="etf" raw={etf?.eth?.total} label={`ETF ETH${etf?.eth ? " (" + etf.eth.date.slice(0, 6) + ")" : ""}`}
               value={etf?.eth ? `${etf.eth.total >= 0 ? "+" : "−"}${Math.abs(etf.eth.total).toFixed(1)}M` : "+82.4M"}
               sub={etf?.eth ? (etf.eth.total >= 0 ? "Entrada" : "Salida") : "snapshot"}
               tone={(etf?.eth ? etf.eth.total : 82.4) >= 0 ? toneClasses.good : toneClasses.danger} />
-            <Live label="Funding BTC" value={derivs?.BTCUSDT ? derivs.BTCUSDT.funding.toFixed(4) + "%" : "—"}
+            <Live metric="funding" raw={derivs?.BTCUSDT?.funding} label="Funding BTC" value={derivs?.BTCUSDT ? derivs.BTCUSDT.funding.toFixed(4) + "%" : "—"}
               sub={derivs?.BTCUSDT ? (derivs.BTCUSDT.funding < 0 ? "Shorts pagan" : "Longs pagan") : "Binance Futures"}
               tone={derivs?.BTCUSDT && derivs.BTCUSDT.funding < 0 ? toneClasses.good : toneClasses.warn} />
-            <Live label="Funding ETH" value={derivs?.ETHUSDT ? derivs.ETHUSDT.funding.toFixed(4) + "%" : "—"}
+            <Live metric="funding" raw={derivs?.ETHUSDT?.funding} label="Funding ETH" value={derivs?.ETHUSDT ? derivs.ETHUSDT.funding.toFixed(4) + "%" : "—"}
               sub={derivs?.ETHUSDT ? (derivs.ETHUSDT.funding < 0 ? "Shorts pagan" : "Longs pagan") : "Binance Futures"}
               tone={derivs?.ETHUSDT && derivs.ETHUSDT.funding < 0 ? toneClasses.good : toneClasses.warn} />
-            <Live label="Open Interest BTC+ETH"
+            <Live metric="openInterest" label="Open Interest BTC+ETH"
               value={derivs ? "$" + ((derivs.BTCUSDT?.oiUsd ?? 0) + (derivs.ETHUSDT?.oiUsd ?? 0) > 1e9
                 ? (((derivs.BTCUSDT?.oiUsd ?? 0) + (derivs.ETHUSDT?.oiUsd ?? 0)) / 1e9).toFixed(1) + "B"
                 : (((derivs.BTCUSDT?.oiUsd ?? 0) + (derivs.ETHUSDT?.oiUsd ?? 0)) / 1e6).toFixed(0) + "M") : "—"}
@@ -1463,22 +1551,22 @@ export default function Cockpit() {
           </div>
           <div className="flex items-center gap-2 mb-2"><Radio size={15} className="text-emerald-400" /><h2 className="text-sm font-mono tracking-wide text-slate-300">On-chain & ciclo — live, actualización diaria</h2></div>
           <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2">
-            <Live label="Puell Multiple" value={onchain?.puell ? onchain.puell.value.toFixed(2) : "—"}
+            <Live metric="puell" raw={onchain?.puell?.value} label="Puell Multiple" value={onchain?.puell ? onchain.puell.value.toFixed(2) : "—"}
               sub={onchain?.puell ? (onchain.puell.value < 0.8 ? "Infravalorado" : onchain.puell.value > 3 ? "Sobrecalentado" : "Neutral") : "bitcoin-data.com"}
               tone={onchain?.puell ? (onchain.puell.value < 0.8 ? toneClasses.good : onchain.puell.value > 3 ? toneClasses.danger : toneClasses.warn) : toneClasses.warn} />
-            <Live label="MVRV Z-Score" value={onchain?.mvrvz ? onchain.mvrvz.value.toFixed(2) : "—"}
+            <Live metric="mvrvz" raw={onchain?.mvrvz?.value} label="MVRV Z-Score" value={onchain?.mvrvz ? onchain.mvrvz.value.toFixed(2) : "—"}
               sub={onchain?.mvrvz ? (onchain.mvrvz.value < 1 ? "Zona de valor" : onchain.mvrvz.value > 5 ? "Zona de techo" : "Neutral") : "bitcoin-data.com"}
               tone={onchain?.mvrvz ? (onchain.mvrvz.value < 1 ? toneClasses.good : onchain.mvrvz.value > 5 ? toneClasses.danger : toneClasses.warn) : toneClasses.warn} />
-            <Live label="Mayer Multiple" value={daily ? daily.mayer.toFixed(2) : "—"}
+            <Live metric="mayer" raw={daily?.mayer} label="Mayer Multiple" value={daily ? daily.mayer.toFixed(2) : "—"}
               sub={daily ? (daily.mayer < 1 ? "< media 200D" : daily.mayer > 2.4 ? "> 2.4 techo" : "Sobre la media") : "calculado de Binance"}
               tone={daily ? (daily.mayer < 1 ? toneClasses.good : daily.mayer > 2.4 ? toneClasses.danger : toneClasses.warn) : toneClasses.warn} />
-            <Live label="RSI 22D" value={daily?.rsi22 != null ? daily.rsi22.toFixed(1) : "—"}
+            <Live metric="rsi22" raw={daily?.rsi22} label="RSI 22D" value={daily?.rsi22 != null ? daily.rsi22.toFixed(1) : "—"}
               sub={daily?.rsi22 != null ? (daily.rsi22 <= 30 ? "Sobreventa" : daily.rsi22 >= 70 ? "Sobrecompra" : "Neutral") : "calculado de Binance"}
               tone={daily?.rsi22 != null ? (daily.rsi22 <= 30 ? toneClasses.good : daily.rsi22 >= 70 ? toneClasses.danger : toneClasses.warn) : toneClasses.warn} />
-            <Live label="Cycle Top" value={onchain?.cycleTop ? `${onchain.cycleTop.hit}/${onchain.cycleTop.total}` : "—"}
+            <Live metric="cycleTop" raw={onchain?.cycleTop?.hit} label="Cycle Top" value={onchain?.cycleTop ? `${onchain.cycleTop.hit}/${onchain.cycleTop.total}` : "—"}
               sub={onchain?.cycleTop ? (onchain.cycleTop.hit === 0 ? "Hold" : "Señales de techo") : "Coinglass"}
               tone={onchain?.cycleTop ? (onchain.cycleTop.hit === 0 ? toneClasses.good : onchain.cycleTop.hit < 5 ? toneClasses.warn : toneClasses.danger) : toneClasses.warn} />
-            <Live label="Altcoin Season" value={onchain?.altseason ? String(onchain.altseason.value) : "—"}
+            <Live metric="altseason" raw={onchain?.altseason?.value} label="Altcoin Season" value={onchain?.altseason ? String(onchain.altseason.value) : "—"}
               sub={onchain?.altseason ? (onchain.altseason.value >= 75 ? "Altseason" : onchain.altseason.value <= 25 ? "Bitcoin season" : "NO altseason") : "CoinMarketCap"}
               tone={onchain?.altseason ? (onchain.altseason.value >= 75 ? toneClasses.danger : toneClasses.warn) : toneClasses.warn} />
           </div>
@@ -1508,7 +1596,7 @@ export default function Cockpit() {
                       : toneClasses.warn}
                   />
                   <Live
-                    label={`${sym} · sentimiento`}
+                    metric="social" raw={a?.sentimentUp} label={`${sym} · sentimiento`}
                     value={a?.sentimentUp != null ? `${a.sentimentUp}%` : "—"}
                     sub={a?.sentimentUp != null
                       ? (a.sentimentUp >= 70 ? "Optimismo alto" : a.sentimentUp <= 45 ? "Pesimismo" : "Mixto")
@@ -1529,6 +1617,27 @@ export default function Cockpit() {
           <p className="mt-1 text-[10px] text-slate-600">
             Mucha mención + sentimiento muy optimista suele marcar techos locales; silencio con pesimismo suele marcar suelos.
           </p>
+
+          {/* Lectura conjunta: es donde la IA aporta, cruzando variables. */}
+          <div className="mt-4 rounded-lg border border-violet-500/30 bg-violet-500/5 p-3">
+            <div className="flex items-center gap-2 mb-1.5">
+              <Sparkles size={13} className="text-violet-400" />
+              <h3 className="text-[10px] font-mono uppercase tracking-wider text-violet-300">
+                Qué dice el conjunto de las variables
+              </h3>
+              {marketSummary?.model && (
+                <span className="ml-auto text-[9px] font-mono text-slate-500">{marketSummary.model}</span>
+              )}
+            </div>
+            {marketSummary?.text ? (
+              <p className="text-[11px] text-slate-300 leading-relaxed">{marketSummary.text}</p>
+            ) : (
+              <p className="text-[11px] text-slate-500">Cruzando las variables entre sí…</p>
+            )}
+            <p className="mt-2 text-[9px] text-slate-600">
+              Toca cualquier variable de arriba para ver qué mide y qué implica su valor actual.
+            </p>
+          </div>
         </section>
 
         <RiskPortfolioManager
