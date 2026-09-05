@@ -43,6 +43,64 @@ export default async (req) => {
   }
 
   const store = getStore({ name: "signals", consistency: "strong" });
+
+  // ?setup=1 registra el webhook desde el servidor usando las variables que ya
+  // están en Netlify. Hacerlo a mano en el navegador es donde se cuela el
+  // fallo típico: olvidar &secret_token=..., con lo que Telegram entrega sin
+  // cabecera de secreto y el receptor lo descarta en silencio. Aquí el secreto
+  // sale de la misma variable que valida la recepción, así que no puede
+  // desajustarse. El token nunca se devuelve en la respuesta.
+  if (new URL(req.url).searchParams.get("setup") === "1") {
+    const token = process.env.TELEGRAM_BOT_TOKEN;
+    const secret = process.env.TELEGRAM_WEBHOOK_SECRET;
+    if (!token || !secret) {
+      return jsonResponse({ error: "Faltan TELEGRAM_BOT_TOKEN o TELEGRAM_WEBHOOK_SECRET en Netlify." }, 400);
+    }
+    const base = new URL(req.url).origin;
+    const hook = `${base}/.netlify/functions/telegram`;
+    try {
+      const set = await (await fetch(`https://api.telegram.org/bot${token}/setWebhook`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          url: hook,
+          secret_token: secret,
+          allowed_updates: ["message", "channel_post", "edited_message"],
+        }),
+      })).json();
+      const info = await (await fetch(`https://api.telegram.org/bot${token}/getWebhookInfo`)).json();
+      const r = info?.result || {};
+      return jsonResponse({
+        registrado: set?.ok === true,
+        descripcion: set?.description || set?.description,
+        webhook: {
+          url: r.url,
+          pendientes: r.pending_update_count,
+          ultimoError: r.last_error_message || null,
+          ultimoErrorAt: r.last_error_date ? new Date(r.last_error_date * 1000).toISOString() : null,
+          conSecreto: !!r.has_custom_certificate || undefined,
+        },
+      });
+    } catch (e) {
+      return jsonResponse({ error: String(e).slice(0, 200) }, 500);
+    }
+  }
+
+  // ?debug=1 muestra por qué se descartaron los últimos envíos, junto con qué
+  // variables están puestas (nunca su valor).
+  if (new URL(req.url).searchParams.get("debug") === "1") {
+    let rej = [];
+    try { rej = (await store.get("rejections", { type: "json" })) || []; } catch { /* sin registros */ }
+    return jsonResponse({
+      descartes: rej,
+      variables: {
+        TELEGRAM_WEBHOOK_SECRET: !!process.env.TELEGRAM_WEBHOOK_SECRET,
+        TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID || null,
+        TELEGRAM_BOT_TOKEN: !!process.env.TELEGRAM_BOT_TOKEN,
+      },
+    });
+  }
+
   let list = [];
   try { list = (await store.get("telegram", { type: "json" })) || []; } catch { /* vacío */ }
 

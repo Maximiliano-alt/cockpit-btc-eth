@@ -18,28 +18,66 @@ const store = () => getStore({ name: "signals", consistency: "strong" });
 const KEY = "telegram";
 const MAX = 60;
 
+/**
+ * Deja constancia de por qué se descartó un envío.
+ *
+ * Los filtros responden 200 y no guardan nada, que es lo correcto de cara a
+ * Telegram (un error haría que reintentara en bucle) pero deja el fallo mudo:
+ * un mensaje reenviado que no aparece no dice si falló el secreto, el chat o
+ * el contenido. Esto lo registra sin exponer el secreto: solo si coincidió.
+ */
+async function logRejection(motivo, extra = {}) {
+  console.log(`[telegram] descartado: ${motivo}`, JSON.stringify(extra));
+  try {
+    const s = store();
+    const prev = (await s.get("rejections", { type: "json" })) || [];
+    await s.setJSON("rejections", [{ at: Date.now(), motivo, ...extra }, ...prev].slice(0, 10));
+  } catch { /* el diagnóstico nunca debe romper la recepción */ }
+}
+
 export default async (req) => {
   if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
 
   const secret = process.env.TELEGRAM_WEBHOOK_SECRET;
-  if (!secret || req.headers.get("x-telegram-bot-api-secret-token") !== secret) {
+  const enviado = req.headers.get("x-telegram-bot-api-secret-token");
+  if (!secret || enviado !== secret) {
+    await logRejection(
+      !secret ? "TELEGRAM_WEBHOOK_SECRET no está configurado en Netlify"
+        : !enviado ? "la petición no traía cabecera de secreto (¿webhook registrado sin secret_token?)"
+        : "el secreto de la petición no coincide con TELEGRAM_WEBHOOK_SECRET",
+      { traiaCabecera: !!enviado }
+    );
     // 200 a propósito: si devolviéramos error, Telegram reintentaría en bucle.
     return new Response("ok", { status: 200 });
   }
 
   let update = {};
-  try { update = await req.json(); } catch { return new Response("ok", { status: 200 }); }
+  try { update = await req.json(); } catch {
+    await logRejection("cuerpo no era JSON válido");
+    return new Response("ok", { status: 200 });
+  }
 
   const msg = update.message || update.channel_post || update.edited_message;
-  if (!msg) return new Response("ok", { status: 200 });
+  if (!msg) {
+    await logRejection("actualización sin mensaje", { claves: Object.keys(update).slice(0, 6) });
+    return new Response("ok", { status: 200 });
+  }
 
   const allowed = String(process.env.TELEGRAM_CHAT_ID || "").trim();
   if (allowed && String(msg.chat?.id) !== allowed) {
+    await logRejection("el chat no es el autorizado", {
+      chatRecibido: String(msg.chat?.id), chatEsperado: allowed,
+    });
     return new Response("ok", { status: 200 });
   }
 
   const text = (msg.text || msg.caption || "").trim();
-  if (!text) return new Response("ok", { status: 200 });
+  if (!text) {
+    await logRejection("mensaje sin texto (¿solo imagen o adjunto?)", {
+      tipos: Object.keys(msg).filter((k) => ["photo", "video", "document", "poll", "sticker"].includes(k)),
+    });
+    return new Response("ok", { status: 200 });
+  }
 
   // Origen: si es un reenvío, Telegram indica de dónde viene.
   const origen = msg.forward_from_chat?.title
