@@ -13,6 +13,7 @@
 import { callGeminiWithFallback } from "./_lib/gemini.mjs";
 import { withAiCache } from "./_lib/aicache.mjs";
 import { getStore } from "@netlify/blobs";
+import { pollPublicChannels } from "./_lib/tgpoll.mjs";
 
 const TTL = 12 * 60 * 60 * 1000;
 const MAX_ANALIZAR = 8;
@@ -35,12 +36,18 @@ const jsonResponse = (o, s = 200) =>
   new Response(JSON.stringify(o), { status: s, headers: { "content-type": "application/json" } });
 
 export default async (req) => {
+  // ?poll=1 fuerza un sondeo de los canales públicos sin esperar al cron.
+  let polled = null;
+  if (new URL(req.url).searchParams.get("poll") === "1") {
+    try { polled = await pollPublicChannels(); } catch (e) { polled = { error: String(e).slice(0, 140) }; }
+  }
+
   const store = getStore({ name: "signals", consistency: "strong" });
   let list = [];
   try { list = (await store.get("telegram", { type: "json" })) || []; } catch { /* vacío */ }
 
   if (!list.length) {
-    return jsonResponse({ messages: [], readings: {}, configured: !!process.env.TELEGRAM_WEBHOOK_SECRET });
+    return jsonResponse({ messages: [], readings: {}, polled, configured: !!process.env.TELEGRAM_WEBHOOK_SECRET, canalesPublicos: String(process.env.TELEGRAM_PUBLIC_CHANNELS || "").split(",").filter(Boolean) });
   }
 
   const recientes = list.slice(0, MAX_ANALIZAR);
@@ -80,7 +87,7 @@ export default async (req) => {
         return { readings, model: r.model, at: Date.now() };
       },
     });
-    return jsonResponse({ messages: recientes, ...data, served, total: list.length });
+    return jsonResponse({ messages: recientes, ...data, served, polled, total: list.length });
   } catch (e) {
     return jsonResponse({ messages: recientes, readings: {}, error: String(e).slice(0, 160) });
   }

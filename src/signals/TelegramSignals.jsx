@@ -47,8 +47,15 @@ export default function TelegramSignals() {
       {msgs.length === 0 ? (
         <div className="text-[11px] text-slate-500 space-y-1.5">
           <p>
-            Sin mensajes todavía. Reenvía cualquier publicación de Gem Hunters (o de otro canal) al chat
-            privado con tu bot y aparecerá aquí interpretada: activos, sesgo, niveles y tesis.
+            Sin mensajes todavía. Hay dos formas de que lleguen:
+          </p>
+          <p>
+            <b className="text-slate-400">Automática</b> — solo para canales <b>públicos</b>: se configuran en
+            <span className="font-mono"> TELEGRAM_PUBLIC_CHANNELS</span> y el cockpit los lee solo cada 30 min.
+          </p>
+          <p>
+            <b className="text-slate-400">Manual</b> — para canales <b>privados</b> (como las comunidades de pago,
+            que no tienen vista web): reenvías la publicación al chat con tu bot y aparece aquí.
           </p>
           {data && !data.configured && (
             <p className="text-amber-300">
@@ -61,7 +68,7 @@ export default function TelegramSignals() {
         <>
           <p className="text-[10px] text-slate-600">
             Contenido de terceros, resumido por IA. Es contexto para tu criterio — el bot de ejecución no lo
-            usa para operar.
+            usa para operar. Los canales públicos entran solos; los privados, reenviándolos al bot.
           </p>
           <div className="space-y-1.5 max-h-96 overflow-y-auto">
             {msgs.map((m) => {
