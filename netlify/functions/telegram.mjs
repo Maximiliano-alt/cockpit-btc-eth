@@ -63,10 +63,14 @@ export default async (req) => {
     return new Response("ok", { status: 200 });
   }
 
-  const allowed = String(process.env.TELEGRAM_CHAT_ID || "").trim();
-  if (allowed && String(msg.chat?.id) !== allowed) {
+  // Lista separada por comas: permite tener varios chats (por ejemplo el
+  // privado con el bot y un canal propio) sin tener que elegir uno.
+  const allowed = String(process.env.TELEGRAM_CHAT_ID || "")
+    .split(",").map((x) => x.trim()).filter(Boolean);
+  if (allowed.length && !allowed.includes(String(msg.chat?.id))) {
     await logRejection("el chat no es el autorizado", {
-      chatRecibido: String(msg.chat?.id), chatEsperado: allowed,
+      chatRecibido: String(msg.chat?.id), chatEsperado: allowed.join(","),
+      pista: "Copia el valor de chatRecibido en TELEGRAM_CHAT_ID (en getUpdates es fácil confundirlo con el id del bot).",
     });
     return new Response("ok", { status: 200 });
   }
