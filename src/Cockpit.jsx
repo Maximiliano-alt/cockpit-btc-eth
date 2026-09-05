@@ -6,6 +6,7 @@ import {
 import RiskPortfolioManager from "./ros/RiskPortfolioManager.jsx";
 import TradingBot from "./bot/TradingBot.jsx";
 import PositionRegistry from "./positions/PositionRegistry.jsx";
+import TelegramSignals from "./signals/TelegramSignals.jsx";
 import { detectStructure, timeframeBias } from "./ros/structure.js";
 import { fetchCandles, fetchPrices } from "./data/candles.js";
 import { readMetric } from "./data/metricInfo.js";
@@ -1658,6 +1659,8 @@ export default function Cockpit() {
         <Playbook data={aiZones?.playbook} aiModel={aiZones?.model} loading={zonesLoading} />
 
         <PositionRegistry playbook={aiZones?.playbook} />
+
+        <TelegramSignals />
 
         <TradingBot />
 
