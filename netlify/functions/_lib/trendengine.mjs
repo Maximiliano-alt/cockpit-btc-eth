@@ -14,6 +14,7 @@
 import { BinanceFutures, roundStep } from "./broker.mjs";
 import { fetchCandles } from "../../../src/data/candles.js";
 import { getConfig, setConfig, getRuntime, setRuntime, appendLog, todayKey } from "./botstate.mjs";
+import { cockpitSnapshot, divergences } from "./cockpitContext.mjs";
 
 // Colchón sobre el margen libre: comisiones y el deslizamiento entre el
 // precio que se consulta y el de ejecución pueden dejar la orden justa.
@@ -113,6 +114,7 @@ export async function runTrendCycle({ manual = false } = {}) {
     for (const s of signals) {
       decisions.push({ symbol: s.symbol, action: "signal-only", target: s.target, reason: `${s.reason} — no ejecutado (${gateMsg || "bot desarmado"})` });
     }
+    summary.cockpit = await cockpitSnapshot().catch(() => null);
     await appendLog({ type: "cycle", ...summary });
     return summary;
   }
@@ -277,6 +279,13 @@ export async function runTrendCycle({ manual = false } = {}) {
       });
     }
   }
+
+  // Qué decía el resto del cockpit mientras el bot decidía, y en qué
+  // discrepa. No altera la ejecución: es trazabilidad para el operador.
+  summary.cockpit = await cockpitSnapshot().catch(() => null);
+  summary.divergencias = divergences({
+    snapshot: summary.cockpit, positions: account.positions, signals,
+  });
 
   await setRuntime({ trail });
   await appendLog({ type: "cycle", ...summary });

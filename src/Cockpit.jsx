@@ -5,6 +5,7 @@ import {
 } from "lucide-react";
 import RiskPortfolioManager from "./ros/RiskPortfolioManager.jsx";
 import TradingBot from "./bot/TradingBot.jsx";
+import PositionRegistry from "./positions/PositionRegistry.jsx";
 import { detectStructure, timeframeBias } from "./ros/structure.js";
 import { fetchCandles, fetchPrices } from "./data/candles.js";
 import { readMetric } from "./data/metricInfo.js";
@@ -1655,6 +1656,8 @@ export default function Cockpit() {
         <Diagnosis btc={btc} fg={fg} etf={etf} onchain={onchain} ai={ai} cfg={mergedAssets.BTCUSDT} zonesLoading={zonesLoading} />
 
         <Playbook data={aiZones?.playbook} aiModel={aiZones?.model} loading={zonesLoading} />
+
+        <PositionRegistry playbook={aiZones?.playbook} />
 
         <TradingBot />
 

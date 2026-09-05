@@ -280,6 +280,67 @@ function ConfigPanel({ config, onSave, busy, catalog }) {
   );
 }
 
+/**
+ * Qué sabía el resto del cockpit cuando el bot decidió, y en qué discrepa.
+ * Este bloque NO influye en la ejecución: se midió que usar el sentimiento
+ * para modular el tamaño empeoraba el resultado (peor tramo de 26,0% a 17,8-21,7%
+ * anual sobre 7 años), así que el bot sigue la regla probada y aquí solo se
+ * expone el contraste para que puedas intervenir a mano si lo ves necesario.
+ */
+function CockpitLink({ run }) {
+  const c = run?.cockpit;
+  const div = run?.divergencias || [];
+  if (!c) return null;
+  const age = c.zonasAt ? Math.round((Date.now() - c.zonasAt) / 60000) : null;
+  return (
+    <div className="rounded-lg border border-slate-700/60 bg-slate-950/40 p-3">
+      <h3 className="text-[10px] font-mono uppercase tracking-wider text-slate-400 mb-2">
+        Qué decía el cockpit al decidir
+      </h3>
+
+      {c.veredicto && (
+        <p className="text-[11px] text-slate-300 mb-2">
+          <span className="text-slate-500">Diagnóstico · </span>{c.veredicto}
+        </p>
+      )}
+
+      {c.zonas && (
+        <div className="space-y-1 mb-2">
+          {Object.entries(c.zonas).map(([sym, z]) => (
+            <div key={sym} className="font-mono text-[10px] text-slate-400 flex flex-wrap gap-x-3">
+              <span className="text-slate-200 w-20 shrink-0">{sym}</span>
+              {z.poi && <span>POI {z.poi.from.toFixed(0)}–{z.poi.to.toFixed(0)}</span>}
+              {z.target && <span className="text-emerald-400/70">liquidez {z.target.from.toFixed(0)}–{z.target.to.toFixed(0)}</span>}
+              {z.invalidacion != null && <span className="text-rose-400/70">invalidación {z.invalidacion.toFixed(0)}</span>}
+            </div>
+          ))}
+          {age != null && <p className="text-[9px] text-slate-600">zonas calculadas hace {age} min</p>}
+        </div>
+      )}
+
+      {div.length > 0 && (
+        <div className="space-y-1.5 mt-2 pt-2 border-t border-slate-700/60">
+          {div.map((d, i) => (
+            <div key={i} className={`flex items-start gap-2 text-[10px] leading-snug ${
+              d.level === "alto" ? "text-amber-200" : "text-slate-400"}`}>
+              <span className={`shrink-0 mt-0.5 ${d.level === "alto" ? "text-amber-400" : "text-slate-600"}`}>
+                {d.level === "alto" ? "⚠" : "›"}
+              </span>
+              <span><b className="font-mono">{d.symbol}</b> {d.text}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <p className="mt-2 text-[9px] text-slate-600 leading-relaxed">
+        Este análisis no decide las órdenes. Se midió usar el sentimiento para modular el tamaño y empeoraba:
+        el peor tramo caía de 26,0% a 17,8-21,7% anual. El bot ejecuta la regla probada; esto es para que veas
+        el contraste y decidas si intervenir a mano.
+      </p>
+    </div>
+  );
+}
+
 export default function TradingBot() {
   const [state, setState] = useState(null);
   const [err, setErr] = useState(null);
@@ -512,6 +573,10 @@ export default function TradingBot() {
           </div>
         )}
       </div>
+
+      {(lastRun?.cockpit || log?.[0]?.cockpit) && (
+        <CockpitLink run={lastRun || log?.[0]} />
+      )}
 
       <ConfigPanel config={config} busy={busy} catalog={state.catalog} onSave={(c) => act({ action: "config", config: c })} />
 
