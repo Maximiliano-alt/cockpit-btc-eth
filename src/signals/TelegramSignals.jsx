@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from "react";
-import { Send, ExternalLink } from "lucide-react";
+import { Send, ExternalLink, GitCompare, Plus } from "lucide-react";
 
 const SESGO = {
   alcista: "border-emerald-500/40 bg-emerald-500/10 text-emerald-300",
@@ -17,6 +17,37 @@ const hace = (ms) => {
 export default function TelegramSignals() {
   const [data, setData] = useState(null);
   const [open, setOpen] = useState(null);
+  const [saving, setSaving] = useState(null);
+  const [added, setAdded] = useState(null);
+
+  // Convierte la lectura del canal en una idea del registro, con su
+  // invalidación y caducidad. Se usa el soporte más alto como entrada y el
+  // siguiente (o la invalidación que da el propio canal) como stop.
+  const addToRegistry = async (sym, v) => {
+    setSaving(sym);
+    try {
+      const sop = [...(v.canal.soportes || [])].sort((a, b) => b - a);
+      const res = [...(v.canal.resistencias || [])].sort((a, b) => a - b);
+      const entry = sop[0];
+      const stop = v.canal.invalidacion && v.canal.invalidacion < entry
+        ? v.canal.invalidacion : (sop[1] ?? null);
+      const r = await fetch("/.netlify/functions/positions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "add",
+          position: {
+            symbol: sym, side: "long", entry, stop, target: res[0] ?? null,
+            validDays: 14, source: "telegram",
+            note: `Canal: ${v.canal.tesis?.slice(0, 140) || "sin tesis"}`,
+          },
+        }),
+      });
+      const j = await r.json();
+      setAdded(j.ok ? `${sym} añadido al registro con entrada ${entry?.toLocaleString()} e invalidación ${stop?.toLocaleString() ?? "—"}.` : (j.error || "no se pudo añadir"));
+    } catch (e) { setAdded(String(e.message || e)); }
+    finally { setSaving(null); }
+  };
 
   useEffect(() => {
     let live = true;
@@ -70,6 +101,51 @@ export default function TelegramSignals() {
             Contenido de terceros, resumido por IA. Es contexto para tu criterio — el bot de ejecución no lo
             usa para operar. Los canales públicos entran solos; los privados, reenviándolos al bot.
           </p>
+          {data.cruce?.activos && Object.keys(data.cruce.activos).length > 0 && (
+            <div className="rounded-lg border border-violet-500/30 bg-violet-500/5 p-3 space-y-2">
+              <div className="flex items-center gap-2">
+                <GitCompare size={13} className="text-violet-400" />
+                <h3 className="text-[10px] font-mono uppercase tracking-wider text-violet-300">
+                  Cruce con el análisis del cockpit
+                </h3>
+              </div>
+              {Object.entries(data.cruce.activos).map(([sym, v]) => (
+                <div key={sym} className="space-y-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-mono text-[11px] font-bold text-slate-200 w-9">{sym}</span>
+                    <span className={`text-[9px] font-mono px-1.5 py-0.5 rounded border ${
+                      v.veredicto.nivel === "confirma" ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
+                      : v.veredicto.nivel === "parcial" ? "border-amber-500/40 bg-amber-500/10 text-amber-300"
+                      : "border-rose-500/40 bg-rose-500/10 text-rose-300"}`}>
+                      {v.veredicto.nivel.toUpperCase()}
+                    </span>
+                    <span className="text-[10px] text-slate-400 flex-1 min-w-[180px]">{v.veredicto.texto}</span>
+                    <button
+                      type="button"
+                      onClick={() => addToRegistry(sym, v)}
+                      disabled={saving === sym || !v.canal.soportes?.length}
+                      className="inline-flex items-center gap-1 rounded border border-slate-600 px-1.5 py-0.5 text-[10px] font-mono text-slate-300 hover:bg-slate-800 disabled:opacity-40 shrink-0"
+                    >
+                      <Plus size={10} /> {saving === sym ? "…" : "al registro"}
+                    </button>
+                  </div>
+                  {v.coincidencias.map((m, i) => (
+                    <div key={i} className="font-mono text-[10px] text-slate-500 pl-11">
+                      {m.tipo} <span className="text-slate-300">{m.nivelCanal.toLocaleString()}</span> ≈ {m.zonaCockpit}
+                    </div>
+                  ))}
+                  {v.invalidacion && (
+                    <div className={`text-[10px] pl-11 ${Math.abs(v.invalidacion.difPct) >= 2 ? "text-amber-300" : "text-slate-500"}`}>
+                      {v.invalidacion.nota}
+                    </div>
+                  )}
+                </div>
+              ))}
+              <p className="text-[9px] text-slate-600 leading-snug">{data.cruce.nota}</p>
+              {added && <p className="text-[10px] text-emerald-300">{added}</p>}
+            </div>
+          )}
+
           <div className="space-y-1.5 max-h-96 overflow-y-auto">
             {msgs.map((m) => {
               const r = data.readings?.[m.id];

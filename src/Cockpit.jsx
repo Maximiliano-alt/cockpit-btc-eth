@@ -447,6 +447,21 @@ function useAiZones(online, ctxRef) {
           };
         }));
         const { zonasIA, ...contexto } = ctxRef.current || {};
+        // Análisis de terceros del canal de Telegram: se manda SOLO la lectura
+        // ya estructurada (activos, sesgo, niveles), nunca el texto original,
+        // para no abrir una vía de inyección hacia el prompt que genera los
+        // niveles. Va etiquetado como opinión externa sin historial medido.
+        try {
+          const sg = await fetchJSON("/.netlify/functions/signals", 12000);
+          const lecturas = Object.values(sg?.readings || {}).slice(0, 3);
+          if (lecturas.length) {
+            contexto.analisisExterno = {
+              fuente: "canal de Telegram seguido por el usuario",
+              advertencia: "Opinión de terceros sin historial verificado. Trátala como un dato más, no como verdad.",
+              lecturas: lecturas.map((l) => ({ tesis: l.tesis, activos: l.activos })),
+            };
+          }
+        } catch { /* el playbook funciona igual sin esto */ }
         const res = await fetch("/.netlify/functions/zones", {
           method: "POST",
           headers: { "Content-Type": "application/json" },

@@ -4,12 +4,17 @@
 // disponible. Orden: mejor calidad primero, los "lite" como red de seguridad.
 // El modelo configurado en GEMINI_MODEL se intenta al final (es el que más
 // probablemente esté mal configurado o sin cuota, p. ej. un "pro" preview).
+// Los alias "-latest" van primero a propósito: Google retira modelos con
+// nombre de versión sin avisar (gemini-2.0-flash y gemini-2.5-flash-lite
+// empezaron a devolver 404 apuntando a sus reemplazos), mientras que el alias
+// siempre resuelve al vigente. Los nombrados quedan detrás como respaldo, y
+// cada uno tiene su propia cuota diaria, que es lo que multiplica el margen.
 const FREE_MODELS = [
-  "gemini-flash-latest",      // alias del flash más nuevo (hoy: 3.5 Flash)
+  "gemini-flash-latest",
+  "gemini-3.6-flash",
   "gemini-2.5-flash",
-  "gemini-2.5-flash-lite",    // pool aparte, casi siempre con cuota libre
+  "gemini-3.5-flash-lite",
   "gemini-flash-lite-latest",
-  "gemini-2.0-flash",
 ];
 const PER_MODEL_TIMEOUT_MS = 20000;
 
@@ -30,7 +35,9 @@ function candidateModels() {
 // consumen maxOutputTokens (truncando el JSON) y suman segundos de latencia.
 // Para este dashboard queremos respuesta rápida y completa → thinking off.
 function supportsThinkingConfig(model) {
-  return /2\.5|3\.5|-latest/.test(model);
+  // Los "lite" devuelven 400 INVALID_ARGUMENT si se les manda thinkingConfig.
+  if (/lite/i.test(model)) return false;
+  return /2\.5|3\.|-latest/.test(model);
 }
 
 async function callGeminiModel(model, key, system, user, opts) {
